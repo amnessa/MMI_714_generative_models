@@ -37,15 +37,18 @@ def _():
     import matplotlib.pyplot as plt
     from scipy.stats import wasserstein_distance
     from pathlib import Path
+    import marimo as mo
     SEED = 42
     DEFAULT_SMOOTH = 1e-8 # additive smoothing for histogram counts
     RNG = np.random.default_rng(SEED)
     outdir = Path("outputs")
     outdir.mkdir(exist_ok=True)
+
     return (
         DEFAULT_SMOOTH,
         RNG,
         SEED,
+        mo,
         np,
         os,
         outdir,
@@ -58,17 +61,20 @@ def _():
 @app.cell
 def _(RNG, np):
     # ---- Generators ----
-    def make_gaussian(n: int, mean=0.0, std=1.0, rng=RNG) -> np.ndarray:
-        return rng.normal(mean, std, size=n)
 
-    def make_bimodal(n: int, mean1=-2.0, std1=1.0, mean2=2.0, std2=0.7, p=0.5, rng=RNG) -> np.ndarray:
-        k = rng.binomial(1, _p, size=n)
+    def make_gaussian(n: int, mean = 0.0, std= 1.0, rng=RNG) -> np.ndarray:
+        return rng.normal(mean,std,size=n)
+
+    def make_bimodal(n: int, mean1 = -2.0, std1= 1.0, mean2=2.0, std2=0.7, p=0.5, rng=RNG) -> np.ndarray:
+        k= rng.binomial(1, p, size=n)
         x = rng.normal(mean1, std1, size=n)
-        y = rng.normal(mean2, std2, size=n)
-        return np.where(k == 1, x, y)
+        y= rng.normal(mean2, std2, size=n)
+        return np.where(k==1, x, y)
 
     def make_student_t(n: int, df=3, loc=0.0, scale=1.0, rng=RNG) -> np.ndarray:
         return loc + scale * rng.standard_t(df, size=n)
+
+
     return make_bimodal, make_gaussian
 
 
@@ -79,103 +85,119 @@ def _(DEFAULT_SMOOTH, RNG, make_gaussian, np, pd):
         lo = min(np.percentile(x, lo_pct), np.percentile(y, lo_pct))
         hi = max(np.percentile(x, hi_pct), np.percentile(y, hi_pct))
         span = hi - lo
-        return (lo - 0.05 * span, hi + 0.05 * span)
+        return lo - 0.05 * span, hi + 0.05 * span
 
-    def histogram_pmf(x: np.ndarray, bins: int, range_, smoothing: float=DEFAULT_SMOOTH):
-        counts, _edges = np.histogram(x, bins=bins, range=range_)
+    def histogram_pmf(x: np.ndarray, bins: int , range_, smoothing: float = DEFAULT_SMOOTH):
+        counts, edges = np.histogram(x, bins=bins, range=range_)
         counts = counts.astype(float) + smoothing
-        pmf = counts / counts.sum()
-        return (pmf, _edges)
+        pmf = counts/ counts.sum()
+        return pmf, edges
 
-    def kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
+    def kl_divergence(p: np.ndarray, q: np.ndarray)-> float:
         eps = 1e-15
-        _p = np.clip(_p, eps, 1)
-        _q = np.clip(_q, eps, 1)
-        return float(np.sum(_p * (np.log(_p) - np.log(_q))))
+        p = np.clip(p, eps, 1)
+        q = np.clip(q, eps, 1)
+        return float(np.sum(p*(np.log(p)-np.log(q))))
 
     def js_divergence(p: np.ndarray, q: np.ndarray) -> float:
         eps = 1e-15
-        _p = np.clip(_p, eps, 1)
-        _q = np.clip(_q, eps, 1)
-        m = 0.5 * (_p + _q)
-        kl_pm = np.sum(_p * (np.log(_p) - np.log(m)))
-        kl_qm = np.sum(_q * (np.log(_q) - np.log(m)))
+        p = np.clip(p, eps, 1)
+        q = np.clip(q, eps, 1)
+        m = 0.5 * (p + q)
+        kl_pm = np.sum(p * (np.log(p) - np.log(m)))
+        kl_qm = np.sum(q * (np.log(q) - np.log(m)))
         return float(0.5 * (kl_pm + kl_qm))
 
     def w1_from_hist(p: np.ndarray, q: np.ndarray, edges: np.ndarray) -> float:
-        cdf_p = np.cumsum(_p)
-        cdf_q = np.cumsum(_q)
-        widths = np.diff(_edges)
+        cdf_p = np.cumsum(p)
+        cdf_q = np.cumsum(q)
+        widths = np.diff(edges)
         diff = np.abs(cdf_p - cdf_q)
         return float(np.sum(diff * widths))
 
-    def metrics_table_for_bins(P: np.ndarray, Q: np.ndarray, bin_counts, smoothing: float, range_):
-        _rows = []
+    def metrics_table_for_bins(P:np.ndarray, Q:np.ndarray, bin_counts, smoothing: float, range_):
+        rows = []
         for b in bin_counts:
-            _p, _edges = histogram_pmf(P, bins=b, range_=range_, smoothing=smoothing)
-            _q, _ = histogram_pmf(Q, bins=b, range_=range_, smoothing=smoothing)
-            _rows.append(dict(bins=b, KL_PQ=kl_divergence(_p, _q), KL_QP=kl_divergence(_q, _p), JS=js_divergence(_p, _q), W1=w1_from_hist(_p, _q, _edges)))
-        return pd.DataFrame(_rows)
+            p, edges = histogram_pmf(P, bins=b, range_=range_, smoothing=smoothing)
+            q, _ = histogram_pmf(Q, bins=b, range_=range_, smoothing=smoothing)
+            rows.append(dict(
+                        bins=b,
+                        KL_PQ=kl_divergence(p, q),
+                        KL_QP=kl_divergence(q, p),
+                        JS=js_divergence(p, q),
+                        W1=w1_from_hist(p, q, edges),
+            ))
+        return pd.DataFrame(rows)
 
-    def make_disagreement_pairs(n=10000):
-        base = make_gaussian(n, 0.0, 1.0)
-        k = RNG.binomial(1, 0.05, size=n)
+    def make_disagreement_pairs(n=10_000):
+        # (i) W1 large, JS small: small mass far away (large shift cost, small overlap change)
+        base = make_gaussian(n,0.0,1.0)
+        k= RNG.binomial(1, 0.05, size=n) # 5% mass far
         tail = RNG.normal(25.0, 0.5, size=n)
-        Q_far = np.where(k == 1, tail, base)
+        Q_far = np.where(k==1, tail, base)
         pair_i = (base, Q_far, 'Same Gaussian + 5% far tail')
+
+        # (ii) JS large, W1 moderate: interleaved supports (even vs odd bins)
         B = 100
-        _edges = np.linspace(0.0, 1.0, B + 1)  # (i) W1 large, JS small: small mass far away (large shift cost, small overlap change)
-        centers = 0.5 * (_edges[:-1] + _edges[1:])
-        even_mask = np.arange(B) % 2 == 0  # 5% mass far
+        edges = np.linspace(0.0,1.0,B+1)
+        centers= 0.5 * (edges[:-1] + edges[1:])
+        even_mask = np.arange(B) % 2 == 0
         odds_mask = ~even_mask
         n_even = even_mask.sum()
         n_odd = odds_mask.sum()
-        P_centers = np.repeat(centers[even_mask], repeats=n // n_even + 1)[:n]
-        Q_centers = np.repeat(centers[odds_mask], repeats=n // n_odd + 1)[:n]  # (ii) JS large, W1 moderate: interleaved supports (even vs odd bins)
-        jitter = 0.25 * (_edges[1] - _edges[0])
+        P_centers = np.repeat(centers[even_mask], repeats=n//n_even +1)[:n]
+        Q_centers = np.repeat(centers[odds_mask], repeats=n//n_odd +1)[:n]
+        jitter = 0.25 * (edges[1] - edges[0])
         P = P_centers + RNG.normal(0, jitter, size=n)
         Q = Q_centers + RNG.normal(0, jitter, size=n)
         pair_ii = (P, Q, 'Interleaved supports (even vs odd bins)')
-        return {'W1-large_JS-small': pair_i, 'JS-large_W1-moderate': pair_ii}
+
+        return {
+            'W1-large_JS-small': pair_i,
+            'JS-large_W1-moderate': pair_ii,
+        }
+
+
+
+
     return (
         common_range,
         histogram_pmf,
         js_divergence,
         kl_divergence,
         make_disagreement_pairs,
-        metrics_table_for_bins,
         w1_from_hist,
     )
 
 
 @app.cell
 def _(DEFAULT_SMOOTH, histogram_pmf, np, plt, w1_from_hist):
-    def plot_cdfs(P: np.ndarray, Q: np.ndarray, bins: int, range_, title: str, outpath: str, smoothing: float=DEFAULT_SMOOTH):
-        _p, _edges = histogram_pmf(P, bins=bins, range_=range_, smoothing=smoothing)
-        _q, _ = histogram_pmf(Q, bins=bins, range_=range_, smoothing=smoothing)
-        cdf_p = np.concatenate([[0.0], np.cumsum(_p)])
-        cdf_q = np.concatenate([[0.0], np.cumsum(_q)])
-        x = _edges
-        abs_diff = np.abs(cdf_p - cdf_q)
-        w1 = w1_from_hist(_p, _q, _edges)
-        plt.figure(figsize=(7.5, 4.5))
-        plt.subplot(1, 2, 1)
-        plt.step(x, cdf_p, where='post', label='F_P')
-        plt.step(x, cdf_q, where='post', label='F_Q')
-        plt.title(f'{title}\nEmpirical CDFs')
-        plt.xlabel('x')
-        plt.ylabel('F(x)')
-        plt.legend()
-        plt.subplot(1, 2, 2)
-        plt.step(x, abs_diff, where='post', color='tab:red')
-        plt.title(f'|F_P - F_Q|, approx W1 = {w1:.4f}')
-        plt.xlabel('x')
-        plt.ylabel('|ΔCDF|')
-        plt.tight_layout()
-        plt.savefig(outpath, dpi=150)
-        plt.show()
-        plt.close()
-        return w1
+    def plot_cdfs(P: np.ndarray, Q: np.ndarray, bins: int, range_, title: str, outpath: str, smoothing: float = DEFAULT_SMOOTH):
+            p, edges = histogram_pmf(P, bins=bins, range_=range_, smoothing=smoothing)
+            q, _ = histogram_pmf(Q, bins=bins, range_=range_, smoothing=smoothing)
+            cdf_p = np.concatenate([[0.0], np.cumsum(p)])
+            cdf_q = np.concatenate([[0.0], np.cumsum(q)])
+            x = edges
+            abs_diff = np.abs(cdf_p - cdf_q)
+            w1 = w1_from_hist(p, q, edges)
+
+            plt.figure(figsize=(7.5, 4.5))
+            plt.subplot(1, 2, 1)
+            plt.step(x, cdf_p, where='post', label='F_P')
+            plt.step(x, cdf_q, where='post', label='F_Q')
+            plt.title(f'{title}\nEmpirical CDFs')
+            plt.xlabel('x'); plt.ylabel('F(x)'); plt.legend()
+
+            plt.subplot(1, 2, 2)
+            plt.step(x, abs_diff, where='post', color='tab:red')
+            plt.title(f'|F_P - F_Q|, approx W1 = {w1:.4f}')
+            plt.xlabel('x'); plt.ylabel('|ΔCDF|')
+            plt.tight_layout()
+            plt.savefig(outpath, dpi=150)
+            plt.show()
+            plt.close()
+            return w1
+
     return (plot_cdfs,)
 
 
@@ -229,15 +251,18 @@ def _(mo):
     return
 
 
-@app.cell
-def _(DEFAULT_SMOOTH, P1, Q1, display, metrics_table_for_bins, outdir, r1):
+app._unparsable_cell(
+    r"""
     bin_counts = [20, 50, 100]
     smoothing = DEFAULT_SMOOTH
     df_p2 = metrics_table_for_bins(P1, Q1, bin_counts, smoothing, range_=r1)
-    display(df_p2)
+    mo.display(df_p2)
+    mo.
     df_p2.to_csv(outdir / 'p2_metrics.csv', index=False)
     print(f'smoothing used: {smoothing}')
-    return
+    """,
+    name="_"
+)
 
 
 @app.cell(hide_code=True)
@@ -390,4 +415,3 @@ def _():
 
 if __name__ == "__main__":
     app.run()
-
