@@ -13,3 +13,5 @@ scikit-image
 scipy
 pillow
 albumentations
+marimo
+uv
