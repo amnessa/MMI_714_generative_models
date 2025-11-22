@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.17.8"
+__generated_with = "0.18.0"
 app = marimo.App()
 
 
@@ -38,16 +38,17 @@ def _():
     from scipy.stats import wasserstein_distance
     from pathlib import Path
     import marimo as mo
+    from IPython.display import display
     SEED = 42
     DEFAULT_SMOOTH = 1e-8 # additive smoothing for histogram counts
     RNG = np.random.default_rng(SEED)
     outdir = Path("outputs")
     outdir.mkdir(exist_ok=True)
-
     return (
         DEFAULT_SMOOTH,
         RNG,
         SEED,
+        display,
         mo,
         np,
         os,
@@ -166,6 +167,7 @@ def _(DEFAULT_SMOOTH, RNG, make_gaussian, np, pd):
         js_divergence,
         kl_divergence,
         make_disagreement_pairs,
+        metrics_table_for_bins,
         w1_from_hist,
     )
 
@@ -251,18 +253,15 @@ def _(mo):
     return
 
 
-app._unparsable_cell(
-    r"""
+@app.cell
+def _(DEFAULT_SMOOTH, P1, Q1, display, metrics_table_for_bins, outdir, r1):
     bin_counts = [20, 50, 100]
     smoothing = DEFAULT_SMOOTH
     df_p2 = metrics_table_for_bins(P1, Q1, bin_counts, smoothing, range_=r1)
-    mo.display(df_p2)
-    mo.
+    display(df_p2)
     df_p2.to_csv(outdir / 'p2_metrics.csv', index=False)
     print(f'smoothing used: {smoothing}')
-    """,
-    name="_"
-)
+    return
 
 
 @app.cell(hide_code=True)
@@ -294,25 +293,31 @@ def _(
     w1_from_hist,
     wasserstein_distance,
 ):
-    pairs = make_disagreement_pairs(n=10000)
-    _rows = []
-    for key, (P, Q, name) in pairs.items():
+    pairs = make_disagreement_pairs(n=10_000)
+    rows2 = []
+    for key, (P,Q,name) in pairs.items():
         r3 = common_range(P, Q, lo_pct=0.01, hi_pct=99.99)
-        plt.figure(figsize=(6.5, 4.0))  # overlay histogram
+        # overlay histogram
+        plt.figure(figsize=(6.5, 4.0))
         plt.hist(P, bins=100, range=r3, density=True, alpha=0.5, label='P')
         plt.hist(Q, bins=100, range=r3, density=True, alpha=0.5, label='Q')
         plt.title(f'Problem 3: {name}')
-        plt.xlabel('x')
-        plt.ylabel('Density')
-        plt.legend()
-        plt.tight_layout()
-        fname = f'p3_{key}_hist.png'
-        plt.savefig(outdir / fname, dpi=150)  # metrics (hist-based + sample W1)
+        plt.xlabel('x'); plt.ylabel('Density'); plt.legend(); plt.tight_layout()
+        fname= f'p3_{key}_hist.png'
+        plt.savefig(outdir / fname, dpi=150)
         plt.show()
-        _p, _edges = histogram_pmf(P, bins=100, range_=r3, smoothing=DEFAULT_SMOOTH)
-        _q, _ = histogram_pmf(Q, bins=100, range_=r3, smoothing=DEFAULT_SMOOTH)
-        _rows.append(dict(case=key, KL_PQ=kl_divergence(_p, _q), KL_QP=kl_divergence(_q, _p), JS=js_divergence(_p, _q), W1_hist=w1_from_hist(_p, _q, _edges), W1_samples=wasserstein_distance(P, Q)))
-    df_p3 = pd.DataFrame(_rows)
+        # metrics (hist-based + sample W1)
+        p2,edges2 = histogram_pmf(P, bins=100, range_=r3, smoothing=DEFAULT_SMOOTH)
+        q2,_ = histogram_pmf(Q, bins=100, range_=r3, smoothing= DEFAULT_SMOOTH)
+        rows2.append(dict(
+            case=key,
+            KL_PQ=kl_divergence(p2, q2),
+            KL_QP=kl_divergence(q2, p2),
+            JS=js_divergence(p2, q2),
+            W1_hist=w1_from_hist(p2, q2, edges2),
+            W1_samples=wasserstein_distance(P, Q),
+        ))
+    df_p3 = pd.DataFrame(rows2)
     display(df_p3)
     df_p3.to_csv(outdir / 'p3_metrics.csv', index=False)
     return
@@ -368,26 +373,32 @@ def _(
     plt,
     w1_from_hist,
 ):
-    Ns = [200, 1000, 5000, 20000]
+    Ns = [200, 1_000, 5_000, 20_000]
     best_bins = 20
-    _rows = []
+    rows = []
     for N in Ns:
         Pn = make_gaussian(N, 0.0, 1.0)
         Qn = make_bimodal(N, -2.0, 1.0, 2.0, 0.7, 0.5)
         rn = common_range(Pn, Qn)
-        _p, _edges = histogram_pmf(Pn, bins=best_bins, range_=rn, smoothing=DEFAULT_SMOOTH)
-        _q, _ = histogram_pmf(Qn, bins=best_bins, range_=rn, smoothing=DEFAULT_SMOOTH)
-        _rows.append(dict(N=N, KL_PQ=kl_divergence(_p, _q), KL_QP=kl_divergence(_q, _p), JS=js_divergence(_p, _q), W1=w1_from_hist(_p, _q, _edges)))
-    df_p5 = pd.DataFrame(_rows)
+        p,edges = histogram_pmf(Pn, bins=best_bins, range_=rn, smoothing=DEFAULT_SMOOTH)
+        q,_ = histogram_pmf(Qn, bins=best_bins, range_=rn, smoothing=DEFAULT_SMOOTH)
+        rows.append(dict(
+            N=N,
+            KL_PQ=kl_divergence(p, q),
+            KL_QP=kl_divergence(q, p),
+            JS= js_divergence(p, q),
+            W1=w1_from_hist(p, q, edges),
+        ))
+    df_p5 = pd.DataFrame(rows)
     display(df_p5)
     df_p5.to_csv(outdir / 'p2_vs_N.csv', index=False)
-    plt.figure(figsize=(6.5, 4.0))
+
+    plt.figure(figsize=(6.5,4.0))
     for col in ['KL_PQ', 'KL_QP', 'JS', 'W1']:
         plt.plot(df_p5['N'], df_p5[col], marker='o', label=col)
     plt.xscale('log')
     plt.title('Problem 5: Distance vs Sample Size')
-    plt.legend()
-    plt.tight_layout()
+    plt.legend(); plt.tight_layout()
     plt.savefig(outdir / 'p5_vs_N.png', dpi=150)
     plt.show()
     return (best_bins,)
@@ -404,13 +415,8 @@ def _(DEFAULT_SMOOTH, SEED, best_bins, outdir):
         f.write(f'JS uses natural log.)\nKL uses natural log. \n')
         f.write(f'W1 (hist) computed as area under |delta CDF| over shared bin edges.\n')
     print('saved figures and tables in outputs/.')
+
     return
-
-
-@app.cell
-def _():
-    import marimo as mo
-    return (mo,)
 
 
 if __name__ == "__main__":
