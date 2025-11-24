@@ -74,8 +74,6 @@ def _(RNG, np):
 
     def make_student_t(n: int, df=3, loc=0.0, scale=1.0, rng=RNG) -> np.ndarray:
         return loc + scale * rng.standard_t(df, size=n)
-
-
     return make_bimodal, make_gaussian
 
 
@@ -159,8 +157,6 @@ def _(DEFAULT_SMOOTH, RNG, make_gaussian, np, pd):
         }
 
 
-
-
     return (
         common_range,
         histogram_pmf,
@@ -199,7 +195,6 @@ def _(DEFAULT_SMOOTH, histogram_pmf, np, plt, w1_from_hist):
             plt.show()
             plt.close()
             return w1
-
     return (plot_cdfs,)
 
 
@@ -415,7 +410,6 @@ def _(DEFAULT_SMOOTH, SEED, best_bins, outdir):
         f.write(f'JS uses natural log.)\nKL uses natural log. \n')
         f.write(f'W1 (hist) computed as area under |delta CDF| over shared bin edges.\n')
     print('saved figures and tables in outputs/.')
-
     return
 
 
