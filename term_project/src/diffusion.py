@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from .conditional_unet_depth import ConditionalUNetDepth
+from conditional_unet_depth import ConditionalUNetDepth
 
 
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape):

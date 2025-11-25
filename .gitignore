@@ -1,2 +1,3 @@
 book_sources/GenerativeDeepLearning.pdf
 term_project/dataset
+term_project/src/model_epoch_*.pt
