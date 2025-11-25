@@ -9,9 +9,14 @@ from .conditional_unet_depth import ConditionalUNetDepth
 
 
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape):
-    """Helper to gather coefficients at batch indices t and reshape to (B, 1, 1, 1)."""
+    """Helper to gather coefficients at batch indices t and reshape to (B, 1, 1, 1).
+
+    Assumes `a` is a 1D buffer on the same device as the model / inputs.
+    """
     b = t.shape[0]
-    out = a.gather(-1, t.cpu()).to(t.device)
+    # ensure t is on same device and long
+    t = t.to(a.device).long()
+    out = a.gather(0, t)
     return out.view(b, *([1] * (len(x_shape) - 1)))
 
 
