@@ -194,23 +194,19 @@ class ConditionalUNetDepth(nn.Module):
 
         # encoder
         self.downs = nn.ModuleList([])
-        self.resolutions = []
+        self.skip_channels = []  # channels for each skip connection
 
         in_ch = init_dim
-        curr_res = None  # we keep it abstract; attention toggled by feature map resolution proxy
+        curr_res = None  # keep abstract for now (no resolution-based attention)
 
         for i, mult in enumerate(channel_mults):
             out_ch = base_channels * mult
             for _ in range(num_res_blocks):
-                self.downs.append(
-                    nn.ModuleDict(
-                        {
-                            "block": ResnetBlock(in_ch, out_ch, time_emb_dim=time_emb_dim),
-                            "attn": Attention(out_ch) if (curr_res in use_attention_resolutions) else nn.Identity(),
-                        }
-                    )
-                )
+                block = ResnetBlock(in_ch, out_ch, time_emb_dim=time_emb_dim)
+                attn = Attention(out_ch) if (curr_res in use_attention_resolutions) else nn.Identity()
+                self.downs.append(nn.ModuleDict({"block": block, "attn": attn}))
                 in_ch = out_ch
+                self.skip_channels.append(in_ch)
 
             # add downsample between levels, except at the last one
             if i != len(channel_mults) - 1:
@@ -224,13 +220,16 @@ class ConditionalUNetDepth(nn.Module):
         # decoder
         self.ups = nn.ModuleList([])
 
+        # we will traverse skip connections in reverse order
         for i, mult in reversed(list(enumerate(channel_mults))):
             out_ch = base_channels * mult
-            for _ in range(num_res_blocks + 1):  # +1 for combining skip
+            for _ in range(num_res_blocks):
+                # take the last recorded skip channel for concatenation
+                skip_ch = self.skip_channels.pop()
                 self.ups.append(
                     nn.ModuleDict(
                         {
-                            "block": ResnetBlock(in_ch + out_ch, out_ch, time_emb_dim=time_emb_dim),
+                            "block": ResnetBlock(in_ch + skip_ch, out_ch, time_emb_dim=time_emb_dim),
                             "attn": Attention(out_ch) if (curr_res in use_attention_resolutions) else nn.Identity(),
                         }
                     )
