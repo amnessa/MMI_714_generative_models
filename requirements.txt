@@ -3,7 +3,7 @@ albumentations
 ema-pytorch
 einops
 ipykernel
-marimo
+# marimo
 matplotlib
 notebook
 numpy
