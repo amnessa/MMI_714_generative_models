@@ -175,11 +175,13 @@ class ConditionalUNetDepth(nn.Module):
         num_res_blocks: int = 2,
         use_attention_resolutions=(16,),
         time_emb_dim: int = 256,
+        cond_channels: int = 4,
     ):
         super().__init__()
 
         self.in_channels_x = 1
-        self.in_channels_cond = 4  # 3xRGB + 1x raw / incomplete depth
+        # e.g. 3xRGB + 1x raw / incomplete depth [+ optional guidance maps]
+        self.in_channels_cond = cond_channels
         self.out_channels = 1      # noise on depth
 
         self.time_mlp = nn.Sequential(
@@ -263,7 +265,7 @@ class ConditionalUNetDepth(nn.Module):
         """
 
         assert x_noisy_depth.shape[1] == self.in_channels_x, "x_noisy_depth must have 1 channel"
-        assert cond_rgbd.shape[1] == self.in_channels_cond, "cond_rgbd must have 4 channels (RGB + depth)"
+        assert cond_rgbd.shape[1] == self.in_channels_cond, f"cond_rgbd must have {self.in_channels_cond} channels"
 
         if t.dim() == 2 and t.shape[1] == 1:
             t = t.squeeze(1)
@@ -278,11 +280,11 @@ class ConditionalUNetDepth(nn.Module):
 
         # encoder path
         for module in self.downs:
-            if "block" in module:
+            if isinstance(module, nn.ModuleDict) and ("block" in module):
                 x = module["block"](x, time_emb=time_emb)
                 x = module["attn"](x)
                 hs.append(x)
-            elif "downsample" in module:
+            elif isinstance(module, nn.ModuleDict) and ("downsample" in module):
                 x = module["downsample"](x)
 
         # bottleneck
@@ -292,12 +294,12 @@ class ConditionalUNetDepth(nn.Module):
 
         # decoder path
         for module in self.ups:
-            if "block" in module:
+            if isinstance(module, nn.ModuleDict) and ("block" in module):
                 skip = hs.pop()
                 x = torch.cat([x, skip], dim=1)
                 x = module["block"](x, time_emb=time_emb)
                 x = module["attn"](x)
-            elif "upsample" in module:
+            elif isinstance(module, nn.ModuleDict) and ("upsample" in module):
                 x = module["upsample"](x)
 
         x = self.out_norm(x)
@@ -308,10 +310,10 @@ class ConditionalUNetDepth(nn.Module):
 
 if __name__ == "__main__":
     # quick sanity check
-    model = ConditionalUNetDepth()
+    model = ConditionalUNetDepth(cond_channels=5)
     b, h, w = 2, 128, 128
     x_noisy = torch.randn(b, 1, h, w)
-    cond = torch.randn(b, 4, h, w)
+    cond = torch.randn(b, 5, h, w)
     t = torch.randint(0, 1000, (b,), dtype=torch.long)
 
     with torch.no_grad():

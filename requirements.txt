@@ -21,3 +21,4 @@ torchvision
 tqdm
 typeguard
 uv
+opencv-python

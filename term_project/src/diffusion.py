@@ -105,9 +105,10 @@ class GaussianDiffusion(nn.Module):
     ) -> torch.Tensor:
         """Compute epsilon-prediction MSE loss for a batch.
 
-        Expects batch dict with keys:
-          - "pixel_values": (B, 1, H, W) ground truth depth x0
-          - "conditioning": (B, 4, H, W) RGB (3ch) + corrupted depth (1ch)
+                Expects batch dict with keys:
+                    - "pixel_values": (B, 1, H, W) ground truth depth x0
+                    - "conditioning": (B, C, H, W) RGB (3ch) + corrupted depth (1ch) [+ optional guidance]
+                    - optional "loss_mask": (B, 1, H, W) mask for weighted loss (1=include)
         """
         x_start = batch["pixel_values"]
         cond = batch["conditioning"]
@@ -125,7 +126,14 @@ class GaussianDiffusion(nn.Module):
         # model predicts noise given noisy depth and conditioning
         model_out = self.model(x_noisy, cond, t)
 
-        loss = torch.mean((eps - model_out) ** 2)
+        # masked MSE if provided
+        err = (eps - model_out) ** 2
+        loss_mask = batch.get("loss_mask", None)
+        if loss_mask is not None:
+            loss_mask = loss_mask.to(err.device)
+            loss = (err * loss_mask).sum() / (loss_mask.sum() + 1e-8)
+        else:
+            loss = err.mean()
         return loss
 
     # ---------------------------------------------------------------------
