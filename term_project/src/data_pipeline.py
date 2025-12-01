@@ -7,7 +7,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from guidance_maps import GuidanceConfig, m_da, m_rgb
+try:
+    from .guidance_maps import GuidanceConfig, m_da, m_rgb
+except Exception:  # fallback for running as a simple module from notebook
+    from guidance_maps import GuidanceConfig, m_da, m_rgb
 
 
 IMG_EXTS = (".png", ".jpg", ".jpeg")
@@ -92,10 +95,43 @@ class DepthInpaintDataset(Dataset):
     def __init__(self, cfg: DepthDataConfig, guidance_cfg: Optional[GuidanceConfig] = None):
         self.cfg = cfg
         self.gcfg = guidance_cfg or GuidanceConfig()
+        # Try flat layout first: root/rgb_dir, root/depth_dir, root/mask_dir
+        flat_rgb = os.path.join(cfg.root, cfg.rgb_dir)
+        flat_depth = os.path.join(cfg.root, cfg.depth_dir)
+        flat_mask = os.path.join(cfg.root, cfg.mask_dir)
 
-        self.rgb_paths = self._collect(os.path.join(cfg.root, cfg.rgb_dir), IMG_EXTS)
-        self.depth_paths = self._collect(os.path.join(cfg.root, cfg.depth_dir), DEPTH_EXTS)
-        self.mask_paths = self._collect(os.path.join(cfg.root, cfg.mask_dir), MASK_EXTS)
+        self.rgb_paths: List[str] = []
+        self.depth_paths: List[str] = []
+        self.mask_paths: List[str] = []
+
+        if os.path.isdir(flat_rgb) and os.path.isdir(flat_depth) and os.path.isdir(flat_mask):
+            self.rgb_paths = self._collect(flat_rgb, IMG_EXTS)
+            self.depth_paths = self._collect(flat_depth, DEPTH_EXTS)
+            self.mask_paths = self._collect(flat_mask, MASK_EXTS)
+        else:
+            # Nested class layout: iterate subfolders in root and look for subdirs named rgb_dir/depth_dir/mask_dir
+            if not os.path.isdir(cfg.root):
+                raise RuntimeError(f"Root directory does not exist: {cfg.root}")
+
+            class_folders = [os.path.join(cfg.root, d) for d in os.listdir(cfg.root) if os.path.isdir(os.path.join(cfg.root, d))]
+            class_folders.sort()
+
+            for cf in class_folders:
+                rgb_dir = os.path.join(cf, cfg.rgb_dir)
+                depth_dir = os.path.join(cf, cfg.depth_dir)
+                mask_dir = os.path.join(cf, cfg.mask_dir)
+                if not (os.path.isdir(rgb_dir) and os.path.isdir(depth_dir) and os.path.isdir(mask_dir)):
+                    continue
+                rgbs = self._collect(rgb_dir, IMG_EXTS)
+                depths = self._collect(depth_dir, DEPTH_EXTS)
+                masks = self._collect(mask_dir, MASK_EXTS)
+                n_local = min(len(rgbs), len(depths), len(masks))
+                if n_local == 0:
+                    continue
+                # pair by sorted order within class folder
+                self.rgb_paths.extend(rgbs[:n_local])
+                self.depth_paths.extend(depths[:n_local])
+                self.mask_paths.extend(masks[:n_local])
 
         n = min(len(self.rgb_paths), len(self.depth_paths), len(self.mask_paths))
         self.rgb_paths = self.rgb_paths[:n]
