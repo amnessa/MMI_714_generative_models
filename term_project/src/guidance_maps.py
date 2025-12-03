@@ -46,16 +46,42 @@ def depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
     return (edges > 0).astype(np.float32)
 
 
-def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
-    # Depth-Aware boundary map: RGB edges minus Depth edges
+def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig, mask: np.ndarray = None) -> np.ndarray:
+    """
+    Depth-Aware boundary map: RGB edges minus Depth edges.
+    Per DITR paper: M_DA = M_RGB \ C_U(M_D) (set difference)
+    This highlights edges visible in RGB but NOT in depth (ghost edges from transparency).
+
+    If mask is provided, the guidance is computed and applied ONLY within the mask region
+    (transparent/glass area). Outside the mask is set to 0.
+    """
     e_rgb = rgb_edges(rgb_bgr, cfg)
     e_d = depth_edges(depth, cfg)
     out = np.clip(e_rgb - e_d, 0.0, 1.0)
+
+    # Apply mask: guidance only inside transparent region
+    if mask is not None:
+        out = out * mask
+
     return out.astype(np.float32)
 
 
-def m_rgb(rgb_bgr: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
-    return rgb_edges(rgb_bgr, cfg)
+def m_rgb(rgb_bgr: np.ndarray, cfg: GuidanceConfig, mask: np.ndarray = None) -> np.ndarray:
+    """
+    RGB boundary map for geometric inpainting.
+
+    If mask is provided (where mask=1 is transparent area), the guidance is
+    applied ONLY outside the mask region (background). Inside the mask is set to 0.
+    """
+    edges = rgb_edges(rgb_bgr, cfg)
+
+    # Apply inverse mask: guidance only outside transparent region (background)
+    if mask is not None:
+        out = edges * (1.0 - mask)
+    else:
+        out = edges
+
+    return out.astype(np.float32)
 
 
 # Placeholder for SAM-based edges (optional)

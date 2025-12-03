@@ -163,12 +163,17 @@ class DepthInpaintDataset(Dataset):
         raw_norm = corrupt_depth_normalized(depth_norm, mask, c.sigma_mask, c.sigma_global)
 
         # branch-specific: set loss mask and guidance
+        # Per DITR pipeline:
+        # - Optical (Track A): works INSIDE mask (transparent area), uses M_DA guidance inside mask only
+        # - Geometric (Track B): works OUTSIDE mask (background), uses M_RGB guidance outside mask only
         if c.branch == "optical":
-            loss_mask = mask
-            guide = m_da(rgb, depth, self.gcfg) if c.include_guidance else np.zeros_like(mask, dtype=np.float32)
+            loss_mask = mask  # 1 = transparent area where we generate
+            # M_DA = RGB_edges - Depth_edges, applied only inside mask
+            guide = m_da(rgb, depth, self.gcfg, mask=mask) if c.include_guidance else np.zeros_like(mask, dtype=np.float32)
         else:  # geometric
-            loss_mask = 1.0 - mask
-            guide = m_rgb(rgb, self.gcfg) if c.include_guidance else np.zeros_like(mask, dtype=np.float32)
+            loss_mask = 1.0 - mask  # 1 = background area where we generate
+            # M_RGB edges, applied only outside mask (background)
+            guide = m_rgb(rgb, self.gcfg, mask=mask) if c.include_guidance else np.zeros_like(mask, dtype=np.float32)
 
         # to torch tensors
         # RGB to [0,1] then to CHW
