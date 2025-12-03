@@ -49,7 +49,7 @@ def depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
 def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig, mask: np.ndarray = None) -> np.ndarray:
     """
     Depth-Aware boundary map: RGB edges minus Depth edges.
-    Per DITR paper: M_DA = M_RGB \ C_U(M_D) (set difference)
+    Per DITR paper: M_DA = M_RGB \\ C_U(M_D) (set difference)
     This highlights edges visible in RGB but NOT in depth (ghost edges from transparency).
 
     If mask is provided, the guidance is computed and applied ONLY within the mask region
