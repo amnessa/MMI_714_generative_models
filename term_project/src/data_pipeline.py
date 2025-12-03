@@ -21,16 +21,17 @@ MASK_EXTS = (".png", ".jpg", ".jpeg")
 @dataclass
 class DepthDataConfig:
     root: str
-    rgb_dir: str = "rgb"
-    depth_dir: str = "depth"
-    mask_dir: str = "mask"  # binary mask for transparent areas (1=transparent)
-    size: Tuple[int, int] = (256, 256)
-    depth_minmax: Tuple[float, float] = (0.0, 5.0)
+    rgb_dir: str = "rgb-imgs"
+    depth_dir: str = "depth-imgs-rectified"
+    mask_dir: str = "segmentation-masks"  # binary mask for transparent areas (1=transparent)
+    size: Tuple[int, int] = (128, 128)
+    depth_minmax: Tuple[float, float] = (0.0, 3.0)
     # noise parameters in normalized depth space [-1, 1]
     sigma_mask: float = 0.08   # heavy noise in transparent region
     sigma_global: float = 0.01 # light noise overall
     branch: Literal["optical", "geometric"] = "optical"
     include_guidance: bool = True
+
 
 
 def _read_rgb(path: str, size: Tuple[int, int]) -> np.ndarray:
@@ -39,7 +40,6 @@ def _read_rgb(path: str, size: Tuple[int, int]) -> np.ndarray:
         raise FileNotFoundError(path)
     img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
     return img
-
 
 def _read_depth(path: str, size: Tuple[int, int]) -> np.ndarray:
     if path.lower().endswith(".exr"):
@@ -95,7 +95,8 @@ class DepthInpaintDataset(Dataset):
     def __init__(self, cfg: DepthDataConfig, guidance_cfg: Optional[GuidanceConfig] = None):
         self.cfg = cfg
         self.gcfg = guidance_cfg or GuidanceConfig()
-        # Try flat layout first: root/rgb_dir, root/depth_dir, root/mask_dir
+
+        # Check folders
         flat_rgb = os.path.join(cfg.root, cfg.rgb_dir)
         flat_depth = os.path.join(cfg.root, cfg.depth_dir)
         flat_mask = os.path.join(cfg.root, cfg.mask_dir)
@@ -109,7 +110,7 @@ class DepthInpaintDataset(Dataset):
             self.depth_paths = self._collect(flat_depth, DEPTH_EXTS)
             self.mask_paths = self._collect(flat_mask, MASK_EXTS)
         else:
-            # Nested class layout: iterate subfolders in root and look for subdirs named rgb_dir/depth_dir/mask_dir
+            # Fallback for nested structure (class/folder/...)
             if not os.path.isdir(cfg.root):
                 raise RuntimeError(f"Root directory does not exist: {cfg.root}")
 
@@ -128,7 +129,6 @@ class DepthInpaintDataset(Dataset):
                 n_local = min(len(rgbs), len(depths), len(masks))
                 if n_local == 0:
                     continue
-                # pair by sorted order within class folder
                 self.rgb_paths.extend(rgbs[:n_local])
                 self.depth_paths.extend(depths[:n_local])
                 self.mask_paths.extend(masks[:n_local])
@@ -137,8 +137,9 @@ class DepthInpaintDataset(Dataset):
         self.rgb_paths = self.rgb_paths[:n]
         self.depth_paths = self.depth_paths[:n]
         self.mask_paths = self.mask_paths[:n]
+
         if n == 0:
-            raise RuntimeError("No samples found. Check directories.")
+            print(f"[WARNING] No data found in {cfg.root}. Check folder structure.")
 
     def _collect(self, folder: str, exts: Tuple[str, ...]) -> List[str]:
         if not os.path.isdir(folder):
@@ -159,41 +160,43 @@ class DepthInpaintDataset(Dataset):
         # normalize depth to [-1,1]
         depth_norm = _norm_depth(depth, *c.depth_minmax)
 
-        # build raw/corrupted depth with strong noise on mask and slight global noise
-        raw_norm = corrupt_depth_normalized(depth_norm, mask, c.sigma_mask, c.sigma_global)
+        # build raw/corrupted depth with strong noise on mask
+        raw_full = corrupt_depth_normalized(depth_norm, mask, c.sigma_mask, c.sigma_global)
 
-        # branch-specific: set loss mask and guidance
-        # Per DITR pipeline:
-        # - Optical (Track A): works INSIDE mask (transparent area), uses M_DA guidance inside mask only
-        # - Geometric (Track B): works OUTSIDE mask (background), uses M_RGB guidance outside mask only
+        # -------------------------------------------------------------------
+        # CRITICAL FIX: Mask the conditioning Raw Depth based on branch logic
+        # -------------------------------------------------------------------
         if c.branch == "optical":
-            loss_mask = mask  # 1 = transparent area where we generate
-            # M_DA = RGB_edges - Depth_edges, applied only inside mask
-            guide = m_da(rgb, depth, self.gcfg, mask=mask) if c.include_guidance else np.zeros_like(mask, dtype=np.float32)
+            # Track A: Optical Branch (Fixing Glass)
+            # Input: Raw Depth * Mask (Zero out background)
+            # Loss Mask: Mask (Calculate loss only on glass)
+            loss_mask = mask
+            cond_depth = raw_full * mask
+            guide = m_da(rgb, depth, self.gcfg) if c.include_guidance else np.zeros_like(mask)
+
         else:  # geometric
-            loss_mask = 1.0 - mask  # 1 = background area where we generate
-            # M_RGB edges, applied only outside mask (background)
-            guide = m_rgb(rgb, self.gcfg, mask=mask) if c.include_guidance else np.zeros_like(mask, dtype=np.float32)
+            # Track B: Geometric Branch (Fixing Background)
+            # Input: Raw Depth * (1 - Mask) (Zero out glass)
+            # Loss Mask: 1 - Mask (Calculate loss only on background)
+            loss_mask = 1.0 - mask
+            cond_depth = raw_full * (1.0 - mask)
+            guide = m_rgb(rgb, self.gcfg) if c.include_guidance else np.zeros_like(mask)
 
         # to torch tensors
-        # RGB to [0,1] then to CHW
-        rgb_t = torch.from_numpy(rgb[:, :, ::-1].copy()).float() / 255.0  # convert BGR->RGB ordering
-        rgb_t = rgb_t.permute(2, 0, 1)  # CHW
-        depth_t = torch.from_numpy(depth_norm).float().unsqueeze(0)  # 1xHxW
-        raw_t = torch.from_numpy(raw_norm).float().unsqueeze(0)      # 1xHxW
-        guide_t = torch.from_numpy(guide).float().unsqueeze(0)       # 1xHxW
+        rgb_t = torch.from_numpy(rgb[:, :, ::-1].copy()).float() / 255.0  # CHW
+        rgb_t = rgb_t.permute(2, 0, 1)
+
+        depth_t = torch.from_numpy(depth_norm).float().unsqueeze(0)  # GT
+        cond_depth_t = torch.from_numpy(cond_depth).float().unsqueeze(0) # Masked Raw
+        guide_t = torch.from_numpy(guide).float().unsqueeze(0)
         loss_mask_t = torch.from_numpy(loss_mask).float().unsqueeze(0)
 
-        cond = torch.cat([rgb_t, raw_t, guide_t], dim=0)  # (5,H,W)
+        # Conditioning: [RGB (3), Masked_Raw_Depth (1), Guidance (1)]
+        cond = torch.cat([rgb_t, cond_depth_t, guide_t], dim=0)
 
         batch = {
-            "pixel_values": depth_t,        # target clean depth (normalized)
-            "conditioning": cond,           # RGB + raw + guidance
+            "pixel_values": depth_t,        # target clean depth
+            "conditioning": cond,           # RGB + Masked Raw + Guidance
             "loss_mask": loss_mask_t,      # region-specific supervision
-            "meta": {
-                "rgb_path": self.rgb_paths[idx],
-                "depth_path": self.depth_paths[idx],
-                "mask_path": self.mask_paths[idx],
-            },
         }
         return batch
