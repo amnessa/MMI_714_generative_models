@@ -19,6 +19,7 @@ tensorboard
 torch
 torchvision
 tqdm
+transformers
 typeguard
 uv
 opencv-python
