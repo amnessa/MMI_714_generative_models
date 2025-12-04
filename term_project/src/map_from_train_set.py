@@ -16,20 +16,25 @@ GUIDANCE_DIR_GEO = "guidance-geometric-mrgb"
 # Image size
 IMG_SIZE = (128, 128)
 
-def process_dataset(use_sam: bool = False):
+def process_dataset(use_sam_rgb: bool = False, use_sam_depth: bool = False):
     """
     Pre-compute guidance maps for the entire dataset.
 
     Args:
-        use_sam: If True, use SAM for edge detection (slow but high quality).
-                 If False, use Canny/Sobel (fast, good for training).
+        use_sam_rgb: If True, use SAM for RGB edge detection (high quality).
+        use_sam_depth: If True, use SAM for depth edge detection (high quality).
+                       If False, use robust Canny with inverse depth.
     """
+    use_sam = use_sam_rgb or use_sam_depth
+
     # Setup config with robust depth preprocessing
     cfg = GuidanceConfig(
         use_sam=use_sam,
+        use_sam_rgb=use_sam_rgb,
+        use_sam_depth=use_sam_depth,
         sam_device="cuda" if use_sam else "cpu",
         sam_model_name="facebook/sam-vit-base",
-        # Robust depth settings
+        # Robust depth settings (used when use_sam_depth=False)
         depth_max_distance=10.0,
         depth_use_inverse=True,
         depth_use_canny=True,
@@ -38,7 +43,8 @@ def process_dataset(use_sam: bool = False):
         depth_edge_dilate=0,  # No dilation for better M_DA
     )
 
-    print(f"Config: use_sam={use_sam}, inverse_depth={cfg.depth_use_inverse}")
+    print(f"Config: use_sam_rgb={use_sam_rgb}, use_sam_depth={use_sam_depth}")
+    print(f"        inverse_depth={cfg.depth_use_inverse}")
 
     # Walk through dataset - exclude hidden and output folders
     class_folders = [
@@ -138,8 +144,16 @@ def process_dataset(use_sam: bool = False):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--use-sam-rgb", action="store_true",
+                        help="Use SAM for RGB edge detection (high quality)")
+    parser.add_argument("--use-sam-depth", action="store_true",
+                        help="Use SAM for depth edge detection (high quality)")
     parser.add_argument("--use-sam", action="store_true",
-                        help="Use SAM for edge detection (slow)")
+                        help="Use SAM for both RGB and depth (shortcut)")
     args = parser.parse_args()
 
-    process_dataset(use_sam=args.use_sam)
+    # --use-sam enables both
+    use_sam_rgb = args.use_sam or args.use_sam_rgb
+    use_sam_depth = args.use_sam or args.use_sam_depth
+
+    process_dataset(use_sam_rgb=use_sam_rgb, use_sam_depth=use_sam_depth)

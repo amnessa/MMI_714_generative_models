@@ -5,11 +5,13 @@ Run this to debug the guidance map generation before processing the full dataset
 import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+import argparse
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from guidance_maps import (
-    GuidanceConfig, rgb_edges, depth_edges, m_da, m_rgb
+    GuidanceConfig, rgb_edges, depth_edges, m_da, m_rgb,
+    sam_edges_rgb, sam_edges_depth
 )
 
 # Configuration
@@ -49,7 +51,7 @@ def load_sample(class_name: str, idx: int = 0):
 
 
 def visualize_depth_processing(rgb, depth, mask, cfg: GuidanceConfig, title=""):
-    """Visualize the depth edge extraction pipeline."""
+    """Visualize the depth edge extraction pipeline with SAM vs Canny comparison."""
 
     # Raw depth stats
     print(f"\n{'='*60}")
@@ -59,43 +61,65 @@ def visualize_depth_processing(rgb, depth, mask, cfg: GuidanceConfig, title=""):
     print(f"  NaN count: {np.isnan(depth).sum()}, Inf count: {np.isinf(depth).sum()}")
     print(f"  Valid pixels: {np.isfinite(depth).sum()} / {depth.size}")
 
-    # Compute edges
-    e_rgb = rgb_edges(rgb, cfg)
-    e_depth = depth_edges(depth, cfg)
+    # Always compute Canny edges for comparison
+    e_rgb_canny = rgb_edges(rgb, cfg)
+    e_depth_canny = depth_edges(depth, cfg)
 
-    # Compute M_DA
+    # Compute SAM edges if enabled
+    if cfg.use_sam and cfg.use_sam_rgb:
+        e_rgb_sam = sam_edges_rgb(rgb, cfg)
+    else:
+        e_rgb_sam = None
+
+    if cfg.use_sam and cfg.use_sam_depth:
+        e_depth_sam = sam_edges_depth(depth, cfg)
+    else:
+        e_depth_sam = None
+
+    # Compute M_DA and M_RGB (these use SAM or Canny based on config)
     mda = m_da(rgb, depth, cfg, mask)
     mrgb = m_rgb(rgb, cfg, mask)
 
-    # Edge overlap analysis
-    rgb_edge_pixels = e_rgb.sum()
-    depth_edge_pixels = e_depth.sum()
-    overlap = (e_rgb * e_depth).sum()
+    # Determine which edges are actually being used
+    e_rgb_used = e_rgb_sam if (cfg.use_sam and cfg.use_sam_rgb) else e_rgb_canny
+    e_depth_used = e_depth_sam if (cfg.use_sam and cfg.use_sam_depth) else e_depth_canny
 
-    print(f"\nEdge analysis:")
-    print(f"  RGB edges: {rgb_edge_pixels:.0f} pixels")
-    print(f"  Depth edges: {depth_edge_pixels:.0f} pixels")
-    print(f"  Overlap: {overlap:.0f} pixels ({100*overlap/max(rgb_edge_pixels,1):.1f}% of RGB edges)")
-    print(f"  M_DA (glass): {mda.sum():.0f} pixels")
-    print(f"  M_RGB (background): {mrgb.sum():.0f} pixels")
+    # Edge overlap analysis (using what's actually used)
+    rgb_edge_pixels = e_rgb_used.sum()
+    depth_edge_pixels = e_depth_used.sum()
+    overlap = (e_rgb_used * e_depth_used).sum()  # Overlap IS M_DA (intersection)
 
-    # Visualize
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-    fig.suptitle(title, fontsize=14)
+    # M_DA is now intersection: min(RGB, Depth) = overlap in binary case
+    mda_raw = np.minimum(e_rgb_used, e_depth_used)
+
+    print(f"\nEdge analysis (method used):")
+    print(f"  RGB edges ({'SAM' if e_rgb_sam is not None else 'Canny'}): {rgb_edge_pixels:.0f} pixels")
+    print(f"  Depth edges ({'SAM' if e_depth_sam is not None else 'Canny'}): {depth_edge_pixels:.0f} pixels")
+    print(f"  Intersection (RGB ∩ Depth): {overlap:.0f} pixels ({100*overlap/max(rgb_edge_pixels,1):.1f}% of RGB edges)")
+    print(f"  M_DA raw (before mask): {mda_raw.sum():.0f} pixels")
+    print(f"  M_DA (glass region only): {mda.sum():.0f} pixels")
+    print(f"  M_RGB (background only): {mrgb.sum():.0f} pixels")
+
+    if e_rgb_sam is not None:
+        print(f"\n  Canny RGB edges: {e_rgb_canny.sum():.0f} px vs SAM RGB: {e_rgb_sam.sum():.0f} px")
+    if e_depth_sam is not None:
+        print(f"  Canny Depth edges: {e_depth_canny.sum():.0f} px vs SAM Depth: {e_depth_sam.sum():.0f} px")
+
+    # Visualize with 3 rows now
+    fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+    fig.suptitle(f"{title}\nRGB: {'SAM' if e_rgb_sam is not None else 'Canny'}, Depth: {'SAM' if e_depth_sam is not None else 'Canny'}", fontsize=14)
 
     # Row 1: Inputs
     axes[0, 0].imshow(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
-    axes[0, 0].set_title("RGB")
+    axes[0, 0].set_title("RGB Input")
     axes[0, 0].axis('off')
 
-    # Show raw depth (clipped for visualization)
     d_viz = np.clip(depth, 0, cfg.depth_max_distance)
     im = axes[0, 1].imshow(d_viz, cmap='viridis')
-    axes[0, 1].set_title(f"Raw Depth (clipped to {cfg.depth_max_distance}m)")
+    axes[0, 1].set_title(f"Raw Depth")
     axes[0, 1].axis('off')
     plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
 
-    # Show inverse depth
     d_inv = 1.0 / (np.clip(depth, 0.001, cfg.depth_max_distance) + 0.001)
     im = axes[0, 2].imshow(d_inv, cmap='magma')
     axes[0, 2].set_title("Inverse Depth (1/z)")
@@ -103,37 +127,87 @@ def visualize_depth_processing(rgb, depth, mask, cfg: GuidanceConfig, title=""):
     plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
 
     axes[0, 3].imshow(mask, cmap='gray')
-    axes[0, 3].set_title("Mask (1=glass)")
+    axes[0, 3].set_title(f"Mask (glass={mask.sum():.0f}px)")
     axes[0, 3].axis('off')
 
-    # Row 2: Edges and guidance
-    axes[1, 0].imshow(e_rgb, cmap='gray')
-    axes[1, 0].set_title(f"RGB Edges ({rgb_edge_pixels:.0f} px)")
+    # Row 2: Edge comparison (Canny vs SAM)
+    axes[1, 0].imshow(e_rgb_canny, cmap='gray')
+    axes[1, 0].set_title(f"RGB Canny ({e_rgb_canny.sum():.0f} px)")
     axes[1, 0].axis('off')
 
-    axes[1, 1].imshow(e_depth, cmap='gray')
-    axes[1, 1].set_title(f"Depth Edges ({depth_edge_pixels:.0f} px)")
+    if e_rgb_sam is not None:
+        axes[1, 1].imshow(e_rgb_sam, cmap='gray')
+        axes[1, 1].set_title(f"RGB SAM ({e_rgb_sam.sum():.0f} px)")
+    else:
+        axes[1, 1].imshow(np.zeros_like(e_rgb_canny), cmap='gray')
+        axes[1, 1].set_title("RGB SAM (disabled)")
     axes[1, 1].axis('off')
 
-    axes[1, 2].imshow(mda, cmap='hot')
-    axes[1, 2].set_title(f"M_DA = RGB - Depth\n(optical guidance, {mda.sum():.0f} px)")
+    axes[1, 2].imshow(e_depth_canny, cmap='gray')
+    axes[1, 2].set_title(f"Depth Canny ({e_depth_canny.sum():.0f} px)")
     axes[1, 2].axis('off')
 
-    axes[1, 3].imshow(mrgb, cmap='hot')
-    axes[1, 3].set_title(f"M_RGB\n(geometric guidance, {mrgb.sum():.0f} px)")
+    if e_depth_sam is not None:
+        axes[1, 3].imshow(e_depth_sam, cmap='gray')
+        axes[1, 3].set_title(f"Depth SAM ({e_depth_sam.sum():.0f} px)")
+    else:
+        axes[1, 3].imshow(np.zeros_like(e_depth_canny), cmap='gray')
+        axes[1, 3].set_title("Depth SAM (disabled)")
     axes[1, 3].axis('off')
 
+    # Row 3: Guidance maps (what actually gets used)
+    axes[2, 0].imshow(e_rgb_used, cmap='gray')
+    axes[2, 0].set_title(f"RGB Used ({rgb_edge_pixels:.0f} px)")
+    axes[2, 0].axis('off')
+
+    axes[2, 1].imshow(mda_raw, cmap='hot')
+    axes[2, 1].set_title(f"M_DA raw (RGB∩Depth)\n({mda_raw.sum():.0f} px)")
+    axes[2, 1].axis('off')
+
+    axes[2, 2].imshow(mda, cmap='hot')
+    axes[2, 2].set_title(f"M_DA × mask\n(optical, {mda.sum():.0f} px)")
+    axes[2, 2].axis('off')
+
+    axes[2, 3].imshow(mrgb, cmap='hot')
+    axes[2, 3].set_title(f"M_RGB × (1-mask)\n(geometric, {mrgb.sum():.0f} px)")
+    axes[2, 3].axis('off')
+
     plt.tight_layout()
-    plt.savefig(f"debug_depth_edges_{title.replace(' ', '_')}.png", dpi=150)
+    safe_title = title.replace(' ', '_').replace('/', '_')
+    plt.savefig(f"debug_edges_{safe_title}.png", dpi=150)
     plt.show()
 
-    return e_rgb, e_depth, mda, mrgb
+    return e_rgb_used, e_depth_used, mda, mrgb
 
 
 def main():
-    # Use classic edge detection (Canny) - no SAM
+    parser = argparse.ArgumentParser(description="Test depth edge extraction methods")
+    parser.add_argument("--use-sam", action="store_true",
+                        help="Use SAM for both RGB and depth edges")
+    parser.add_argument("--use-sam-rgb", action="store_true",
+                        help="Use SAM for RGB edges only")
+    parser.add_argument("--use-sam-depth", action="store_true",
+                        help="Use SAM for depth edges only")
+    parser.add_argument("--sam-model", default="facebook/sam-vit-base",
+                        choices=["facebook/sam-vit-base", "facebook/sam-vit-large"],
+                        help="SAM model to use")
+    parser.add_argument("--num-classes", type=int, default=2,
+                        help="Number of classes to test")
+    parser.add_argument("--samples-per-class", type=int, nargs="+", default=[0, 50, 100],
+                        help="Sample indices to test per class")
+    args = parser.parse_args()
+
+    # If --use-sam is set, enable both RGB and depth SAM
+    use_sam_rgb = args.use_sam or args.use_sam_rgb
+    use_sam_depth = args.use_sam or args.use_sam_depth
+    use_sam = use_sam_rgb or use_sam_depth
+
     cfg = GuidanceConfig(
-        use_sam=False,
+        use_sam=use_sam,
+        use_sam_rgb=use_sam_rgb,
+        use_sam_depth=use_sam_depth,
+        sam_device="cuda" if use_sam else "cpu",
+        sam_model_name=args.sam_model,
         depth_max_distance=10.0,
         depth_use_inverse=True,
         depth_use_canny=True,
@@ -141,8 +215,10 @@ def main():
         depth_canny_thresh2=100,
     )
 
-    print("Testing robust depth edge extraction...")
-    print(f"Config: inverse={cfg.depth_use_inverse}, canny={cfg.depth_use_canny}")
+    print("Testing edge extraction...")
+    print(f"Config: use_sam_rgb={use_sam_rgb}, use_sam_depth={use_sam_depth}")
+    print(f"        sam_model={args.sam_model if use_sam else 'N/A'}")
+    print(f"        inverse_depth={cfg.depth_use_inverse}, canny={cfg.depth_use_canny}")
 
     # Get list of class folders
     class_folders = [f for f in os.listdir(DATASET_ROOT)
@@ -151,12 +227,12 @@ def main():
 
     print(f"Found {len(class_folders)} classes: {class_folders}")
 
-    # Test on a few samples from different classes
-    for class_name in class_folders[:2]:  # Test first 2 classes
+    # Test on samples
+    for class_name in class_folders[:args.num_classes]:
         print(f"\n{'='*60}")
         print(f"Testing class: {class_name}")
 
-        for idx in [0, 50, 100]:  # Test 3 samples per class
+        for idx in args.samples_per_class:
             try:
                 rgb, depth, mask, fname = load_sample(class_name, idx)
                 visualize_depth_processing(

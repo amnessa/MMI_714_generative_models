@@ -24,14 +24,16 @@ class GuidanceConfig:
     depth_edge_dilate: int = 0            # Dilation iterations (0=none, 1-2 for more coverage)
 
     # SAM configuration
-    # NOTE: use_sam=False by default because SAM cannot run in DataLoader workers
-    # (CUDA context issues). Enable SAM only for single-threaded/inference use.
-    use_sam: bool = True
+    # NOTE: SAM cannot run in DataLoader workers (CUDA context issues).
+    # Enable SAM only for single-threaded/inference use or precomputation.
+    use_sam: bool = True                  # Master switch (if False, disables all SAM)
+    use_sam_rgb: bool = True              # Use SAM for RGB edges (high quality)
+    use_sam_depth: bool = True            # Use SAM for depth edges (high quality)
     sam_model_name: str = "facebook/sam-vit-base"
-    sam_points_per_side: int = 32  # Grid density for automatic mask generation
+    sam_points_per_side: int = 32         # Grid density for automatic mask generation
     sam_pred_iou_thresh: float = 0.88
     sam_stability_score_thresh: float = 0.95
-    sam_device: str = "cuda"  # or "cpu"
+    sam_device: str = "cuda"              # or "cpu"
 
 
 # Global SAM model cache to avoid reloading
@@ -74,12 +76,13 @@ def _morph_close(bin_img: np.ndarray, k: int) -> np.ndarray:
 def _extract_boundaries_from_masks(masks: np.ndarray) -> Optional[np.ndarray]:
     """
     Extract boundary/edge map from a set of segmentation masks.
+    Handles inverted masks by checking which representation has more boundary pixels.
 
     Args:
         masks: (N, H, W) binary masks
 
     Returns:
-        (H, W) boundary map where edges between segments are marked
+        (H, W) boundary map where edges between segments are marked (always white=edge)
     """
     if masks is None or len(masks) == 0:
         return None
@@ -88,11 +91,28 @@ def _extract_boundaries_from_masks(masks: np.ndarray) -> Optional[np.ndarray]:
     boundary_map = np.zeros((h, w), dtype=np.float32)
 
     for mask in masks:
-        # Find contours/edges of each mask
-        mask_uint8 = (mask > 0.5).astype(np.uint8) * 255
+        # Normalize mask to binary (handle both 0-1 and 0-255 ranges)
+        if mask.max() > 1:
+            mask_norm = mask / 255.0
+        else:
+            mask_norm = mask
+
+        # Handle potential inversion: check which interpretation gives boundaries
+        # (not filled regions)
+        mask_uint8 = (mask_norm > 0.5).astype(np.uint8) * 255
+
         # Use morphological gradient to find boundaries
         kernel = np.ones((3, 3), np.uint8)
         gradient = cv2.morphologyEx(mask_uint8, cv2.MORPH_GRADIENT, kernel)
+
+        # If the gradient is mostly filled (>30% of image), the mask might be inverted
+        # In that case, we should use the inverse
+        fill_ratio = gradient.sum() / (h * w * 255)
+        if fill_ratio > 0.3:
+            # Likely inverted - use inverse mask
+            mask_uint8_inv = ((1.0 - mask_norm) > 0.5).astype(np.uint8) * 255
+            gradient = cv2.morphologyEx(mask_uint8_inv, cv2.MORPH_GRADIENT, kernel)
+
         boundary_map = np.maximum(boundary_map, gradient.astype(np.float32) / 255.0)
 
     return boundary_map
@@ -377,8 +397,14 @@ def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig,
     """
     Depth-Aware boundary map for OPTICAL inpainting (Track A).
 
-    Per DITR paper: M_DA = M_RGB \\ C_U(M_D) (set difference)
-    This highlights edges visible in RGB but NOT in depth (ghost edges from transparency).
+    Per DITR paper: M_DA = M_RGB \\\\ C_U(M_D) = M_RGB ∩ M_D (INTERSECTION)
+
+    Mathematical proof:
+        M_DA = M_RGB \\\\ C_U(M_D)  where C_U is complement
+        A \\\\ B^c = A ∩ B
+
+    This finds edges that appear in BOTH RGB and Depth ("confirmed" real boundaries).
+    Edges only in RGB (not in M_DA) are likely transparent/reflective ghost edges.
 
     Args:
         rgb_bgr: (H, W, 3) BGR image
@@ -387,17 +413,23 @@ def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig,
         mask: Optional (H, W) mask where 1=transparent area
 
     Returns:
-        (H, W) guidance map, optionally masked to transparent region only
+        (H, W) guidance map - intersection of RGB and Depth edges, masked to transparent region
     """
-    if cfg.use_sam:
+    # RGB edges: use SAM if enabled for RGB
+    if cfg.use_sam and cfg.use_sam_rgb:
         e_rgb = sam_edges_rgb(rgb_bgr, cfg)
-        e_d = sam_edges_depth(depth, cfg)
     else:
         e_rgb = rgb_edges(rgb_bgr, cfg)
+
+    # Depth edges: use SAM if enabled for depth
+    if cfg.use_sam and cfg.use_sam_depth:
+        e_d = sam_edges_depth(depth, cfg)
+    else:
         e_d = depth_edges(depth, cfg)
 
-    # M_DA = RGB edges - Depth edges (set difference)
-    out = np.clip(e_rgb - e_d, 0.0, 1.0)
+    # M_DA = M_RGB ∩ M_D (INTERSECTION, not difference!)
+    # This gives us edges that are confirmed in both modalities
+    out = np.minimum(e_rgb, e_d)  # Intersection for binary maps
 
     # Apply mask: guidance only inside transparent region
     if mask is not None:
@@ -419,7 +451,8 @@ def m_rgb(rgb_bgr: np.ndarray, cfg: GuidanceConfig,
     Returns:
         (H, W) guidance map, optionally masked to background region only
     """
-    if cfg.use_sam:
+    # RGB edges: use SAM if enabled for RGB
+    if cfg.use_sam and cfg.use_sam_rgb:
         edges = sam_edges_rgb(rgb_bgr, cfg)
     else:
         edges = rgb_edges(rgb_bgr, cfg)
@@ -453,7 +486,7 @@ class SAMGuidanceCache:
             key = id(rgb_bgr)
 
         if key not in self._rgb_cache:
-            if self.cfg.use_sam:
+            if self.cfg.use_sam and self.cfg.use_sam_rgb:
                 self._rgb_cache[key] = sam_edges_rgb(rgb_bgr, self.cfg)
             else:
                 self._rgb_cache[key] = rgb_edges(rgb_bgr, self.cfg)
@@ -466,7 +499,7 @@ class SAMGuidanceCache:
             key = id(depth)
 
         if key not in self._depth_cache:
-            if self.cfg.use_sam:
+            if self.cfg.use_sam and self.cfg.use_sam_depth:
                 self._depth_cache[key] = sam_edges_depth(depth, self.cfg)
             else:
                 self._depth_cache[key] = depth_edges(depth, self.cfg)
