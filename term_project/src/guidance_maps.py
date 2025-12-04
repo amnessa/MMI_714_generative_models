@@ -15,9 +15,19 @@ class GuidanceConfig:
     depth_edge_percentile: float = 90.0
     morph_kernel: int = 3
 
+    # Robust depth preprocessing
+    depth_max_distance: float = 10.0      # Far plane clamp (meters)
+    depth_use_inverse: bool = True        # Use 1/z (disparity) for better near-object edges
+    depth_use_canny: bool = True          # Use Canny instead of Sobel for depth
+    depth_canny_thresh1: int = 30         # Lower threshold for depth Canny
+    depth_canny_thresh2: int = 100        # Upper threshold for depth Canny
+    depth_edge_dilate: int = 0            # Dilation iterations (0=none, 1-2 for more coverage)
+
     # SAM configuration
-    use_sam: bool = False
-    sam_model_name: str = "facebook/sam-vit-large"
+    # NOTE: use_sam=False by default because SAM cannot run in DataLoader workers
+    # (CUDA context issues). Enable SAM only for single-threaded/inference use.
+    use_sam: bool = True
+    sam_model_name: str = "facebook/sam-vit-base"
     sam_points_per_side: int = 32  # Grid density for automatic mask generation
     sam_pred_iou_thresh: float = 0.88
     sam_stability_score_thresh: float = 0.95
@@ -89,117 +99,25 @@ def _extract_boundaries_from_masks(masks: np.ndarray) -> Optional[np.ndarray]:
 
 
 def sam_edges_rgb(rgb: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
-    """
-    Use SAM to generate boundary/edge map from RGB image.
-
-    Args:
-        rgb: (H, W, 3) RGB image (uint8, 0-255)
-        cfg: GuidanceConfig with SAM parameters
-
-    Returns:
-        (H, W) boundary map as float32 in [0, 1]
-    """
     model, processor = _get_sam_model(cfg)
 
     # Ensure RGB format and uint8
     if rgb.dtype != np.uint8:
         rgb = (np.clip(rgb, 0, 255)).astype(np.uint8)
 
-    # SAM expects RGB, if BGR convert
     if rgb.shape[2] == 3:
-        rgb_input = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB) if cfg else rgb
+        rgb_input = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
     else:
         rgb_input = rgb
 
     h, w = rgb.shape[:2]
 
-    # Generate grid of input points for automatic segmentation
-    points_per_side = cfg.sam_points_per_side
-    x_coords = np.linspace(0, w - 1, points_per_side, dtype=np.int32)
-    y_coords = np.linspace(0, h - 1, points_per_side, dtype=np.int32)
-
-    # Create grid of points
-    input_points = []
-    for y in y_coords:
-        for x in x_coords:
-            input_points.append([[int(x), int(y)]])
-
-    # Process in batches to avoid OOM
-    all_masks = []
-    batch_size = 16
-
+    # --- OPTIMIZATION START: Compute Image Embeddings ONCE ---
+    # We process the image alone first to get the embeddings
+    inputs_image = processor(rgb_input, return_tensors="pt").to(cfg.sam_device)
     with torch.no_grad():
-        for i in range(0, len(input_points), batch_size):
-            batch_points = input_points[i:i + batch_size]
-
-            # Process each point
-            for points in batch_points:
-                inputs = processor(
-                    rgb_input,
-                    input_points=[points],
-                    return_tensors="pt"
-                )
-                inputs = {k: v.to(cfg.sam_device) for k, v in inputs.items()}
-
-                outputs = model(**inputs)
-
-                # Get masks
-                masks = processor.image_processor.post_process_masks(
-                    outputs.pred_masks.cpu(),
-                    inputs["original_sizes"].cpu(),
-                    inputs["reshaped_input_sizes"].cpu()
-                )[0]
-
-                # Filter by IoU score
-                iou_scores = outputs.iou_scores.cpu().numpy()[0]
-                for j, score in enumerate(iou_scores[0]):
-                    if score > cfg.sam_pred_iou_thresh:
-                        mask = masks[0, j].numpy()
-                        all_masks.append(mask)
-
-    if len(all_masks) == 0:
-        # Fallback to classical edge detection
-        return rgb_edges(rgb, cfg)
-
-    all_masks = np.array(all_masks)
-    boundary_map = _extract_boundaries_from_masks(all_masks)
-
-    # Apply morphological closing
-    boundary_map = _morph_close((boundary_map * 255).astype(np.uint8), cfg.morph_kernel)
-    boundary_map = (boundary_map > 0).astype(np.float32)
-
-    return boundary_map
-
-
-def sam_edges_depth(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
-    """
-    Use SAM to generate boundary/edge map from depth image.
-    Depth is converted to a pseudo-RGB representation for SAM.
-
-    Args:
-        depth: (H, W) depth image as float32
-        cfg: GuidanceConfig with SAM parameters
-
-    Returns:
-        (H, W) boundary map as float32 in [0, 1]
-    """
-    model, processor = _get_sam_model(cfg)
-
-    # Normalize depth to 0-255 range
-    d = depth.astype(np.float32)
-    d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
-
-    d_min, d_max = d.min(), d.max()
-    if d_max - d_min > 1e-6:
-        d_norm = (d - d_min) / (d_max - d_min)
-    else:
-        d_norm = np.zeros_like(d)
-
-    # Convert to pseudo-RGB (grayscale replicated 3 times)
-    depth_uint8 = (d_norm * 255).astype(np.uint8)
-    depth_rgb = np.stack([depth_uint8, depth_uint8, depth_uint8], axis=-1)
-
-    h, w = depth.shape[:2]
+        image_embeddings = model.get_image_embeddings(inputs_image["pixel_values"])
+    # --- OPTIMIZATION END ---
 
     # Generate grid of input points
     points_per_side = cfg.sam_points_per_side
@@ -212,41 +130,143 @@ def sam_edges_depth(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
             input_points.append([[int(x), int(y)]])
 
     all_masks = []
+    batch_size = 16  # You can likely increase this to 32 or 64 now
+
+    with torch.no_grad():
+        for i in range(0, len(input_points), batch_size):
+            batch_points = input_points[i:i + batch_size]
+
+            # Use processor to format points, but we will DISCARD the pixel_values
+            # so the model uses our cached embeddings instead.
+            inputs = processor(
+                rgb_input,
+                input_points=[batch_points], # Note: processor handles list of lists
+                return_tensors="pt"
+            )
+
+            # Remove pixel_values so model doesn't re-run encoder
+            inputs.pop("pixel_values", None)
+
+            # Add our cached embeddings
+            inputs["image_embeddings"] = image_embeddings
+
+            # Move remaining inputs (like input_points) to device
+            inputs = {k: v.to(cfg.sam_device) for k, v in inputs.items()}
+
+            outputs = model(**inputs)
+
+            # Get masks
+            masks = processor.image_processor.post_process_masks(
+                outputs.pred_masks.cpu(),
+                inputs["original_sizes"].cpu(),
+                inputs["reshaped_input_sizes"].cpu()
+            )[0]
+
+            iou_scores = outputs.iou_scores.cpu().numpy()[0]
+            for j, score in enumerate(iou_scores[0]):
+                if score > cfg.sam_pred_iou_thresh:
+                    mask = masks[0, j].numpy()
+                    all_masks.append(mask)
+
+    if len(all_masks) == 0:
+        return rgb_edges(rgb, cfg)
+
+    all_masks = np.array(all_masks)
+    boundary_map = _extract_boundaries_from_masks(all_masks)
+    boundary_map = _morph_close((boundary_map * 255).astype(np.uint8), cfg.morph_kernel)
+    boundary_map = (boundary_map > 0).astype(np.float32)
+
+    return boundary_map
+
+
+def sam_edges_depth(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
+    """
+    Use SAM to generate boundary/edge map from depth image.
+    Uses robust preprocessing: sanitization + inverse depth for better edges.
+    """
+    model, processor = _get_sam_model(cfg)
+
+    # Robust depth preprocessing (same as depth_edges)
+    d = depth.astype(np.float32)
+
+    # Sanitize NaN/Inf
+    d = np.nan_to_num(d, nan=cfg.depth_max_distance,
+                       posinf=cfg.depth_max_distance,
+                       neginf=0.0)
+    d = np.clip(d, 0, cfg.depth_max_distance)
+
+    # Convert to inverse depth for better near-object representation
+    if cfg.depth_use_inverse:
+        epsilon = 1e-3
+        d_inv = 1.0 / (d + epsilon)
+        d_min, d_max = d_inv.min(), d_inv.max()
+        if d_max - d_min > 1e-6:
+            d_norm = (d_inv - d_min) / (d_max - d_min)
+        else:
+            d_norm = np.zeros_like(d_inv)
+    else:
+        d_min, d_max = d.min(), d.max()
+        if d_max - d_min > 1e-6:
+            d_norm = (d - d_min) / (d_max - d_min)
+        else:
+            d_norm = np.zeros_like(d)
+
+    depth_uint8 = (d_norm * 255).astype(np.uint8)
+    depth_rgb = np.stack([depth_uint8, depth_uint8, depth_uint8], axis=-1)
+
+    h, w = depth.shape[:2]
+
+    # --- OPTIMIZATION START ---
+    inputs_image = processor(depth_rgb, return_tensors="pt").to(cfg.sam_device)
+    with torch.no_grad():
+        image_embeddings = model.get_image_embeddings(inputs_image["pixel_values"])
+    # --- OPTIMIZATION END ---
+
+    points_per_side = cfg.sam_points_per_side
+    x_coords = np.linspace(0, w - 1, points_per_side, dtype=np.int32)
+    y_coords = np.linspace(0, h - 1, points_per_side, dtype=np.int32)
+
+    input_points = []
+    for y in y_coords:
+        for x in x_coords:
+            input_points.append([[int(x), int(y)]])
+
+    all_masks = []
     batch_size = 16
 
     with torch.no_grad():
         for i in range(0, len(input_points), batch_size):
             batch_points = input_points[i:i + batch_size]
 
-            for points in batch_points:
-                inputs = processor(
-                    depth_rgb,
-                    input_points=[points],
-                    return_tensors="pt"
-                )
-                inputs = {k: v.to(cfg.sam_device) for k, v in inputs.items()}
+            inputs = processor(
+                depth_rgb,
+                input_points=[batch_points],
+                return_tensors="pt"
+            )
 
-                outputs = model(**inputs)
+            inputs.pop("pixel_values", None)
+            inputs["image_embeddings"] = image_embeddings
+            inputs = {k: v.to(cfg.sam_device) for k, v in inputs.items()}
 
-                masks = processor.image_processor.post_process_masks(
-                    outputs.pred_masks.cpu(),
-                    inputs["original_sizes"].cpu(),
-                    inputs["reshaped_input_sizes"].cpu()
-                )[0]
+            outputs = model(**inputs)
 
-                iou_scores = outputs.iou_scores.cpu().numpy()[0]
-                for j, score in enumerate(iou_scores[0]):
-                    if score > cfg.sam_pred_iou_thresh:
-                        mask = masks[0, j].numpy()
-                        all_masks.append(mask)
+            masks = processor.image_processor.post_process_masks(
+                outputs.pred_masks.cpu(),
+                inputs["original_sizes"].cpu(),
+                inputs["reshaped_input_sizes"].cpu()
+            )[0]
+
+            iou_scores = outputs.iou_scores.cpu().numpy()[0]
+            for j, score in enumerate(iou_scores[0]):
+                if score > cfg.sam_pred_iou_thresh:
+                    mask = masks[0, j].numpy()
+                    all_masks.append(mask)
 
     if len(all_masks) == 0:
-        # Fallback to classical edge detection
         return depth_edges(depth, cfg)
 
     all_masks = np.array(all_masks)
     boundary_map = _extract_boundaries_from_masks(all_masks)
-
     boundary_map = _morph_close((boundary_map * 255).astype(np.uint8), cfg.morph_kernel)
     boundary_map = (boundary_map > 0).astype(np.float32)
 
@@ -270,15 +290,81 @@ def rgb_edges(rgb_bgr: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
 
 
 def depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
-    """Classical Sobel edge detection on depth."""
+    """
+    Robust edge detection on depth maps.
+
+    Handles the challenges of raw EXR depth data:
+    1. Sanitizes NaN/Inf values (sensor errors, sky)
+    2. Optionally converts to inverse depth (1/z) for better near-object edges
+    3. Normalizes to 0-255 range for edge detection
+    4. Uses Canny (more robust) or Sobel for edge extraction
+
+    Args:
+        depth: (H, W) raw depth map (can contain NaN, Inf, large values)
+        cfg: GuidanceConfig with depth preprocessing parameters
+
+    Returns:
+        (H, W) binary edge map as float32 in [0, 1]
+    """
     d = depth.astype(np.float32)
-    d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
-    gx = cv2.Sobel(d, cv2.CV_32F, 1, 0, ksize=cfg.depth_sobel_ksize)
-    gy = cv2.Sobel(d, cv2.CV_32F, 0, 1, ksize=cfg.depth_sobel_ksize)
-    mag = np.sqrt(gx * gx + gy * gy)
-    thr = np.percentile(mag, cfg.depth_edge_percentile)
-    edges = (mag >= thr).astype(np.uint8) * 255
+
+    # Step 1: Create validity mask (before sanitization)
+    valid_mask = np.isfinite(d) & (d > 0)
+
+    # Step 2: Sanitize - replace NaN/Inf with far plane, clip to max distance
+    d = np.nan_to_num(d, nan=cfg.depth_max_distance,
+                       posinf=cfg.depth_max_distance,
+                       neginf=0.0)
+    d = np.clip(d, 0, cfg.depth_max_distance)
+
+    # Step 3: Convert to inverse depth (disparity) if enabled
+    # Inverse depth emphasizes near objects and compresses far objects
+    # This is crucial because transparent objects are usually close to the camera
+    if cfg.depth_use_inverse:
+        # Add epsilon to avoid division by zero
+        epsilon = 1e-3
+        d_inv = 1.0 / (d + epsilon)
+        # Normalize inverse depth to [0, 1]
+        d_min, d_max = d_inv.min(), d_inv.max()
+        if d_max - d_min > 1e-6:
+            d_norm = (d_inv - d_min) / (d_max - d_min)
+        else:
+            d_norm = np.zeros_like(d_inv)
+    else:
+        # Linear normalization
+        d_min, d_max = d.min(), d.max()
+        if d_max - d_min > 1e-6:
+            d_norm = (d - d_min) / (d_max - d_min)
+        else:
+            d_norm = np.zeros_like(d)
+
+    # Step 4: Convert to uint8 for edge detection
+    d_uint8 = (d_norm * 255).astype(np.uint8)
+
+    # Step 5: Apply Gaussian blur to reduce noise
+    d_uint8 = cv2.GaussianBlur(d_uint8, (3, 3), 0)
+
+    # Step 6: Edge detection
+    if cfg.depth_use_canny:
+        # Canny is more robust and produces cleaner edges
+        edges = cv2.Canny(d_uint8, cfg.depth_canny_thresh1, cfg.depth_canny_thresh2,
+                          apertureSize=cfg.rgb_canny_aperture)
+    else:
+        # Fallback to Sobel
+        gx = cv2.Sobel(d_uint8, cv2.CV_32F, 1, 0, ksize=cfg.depth_sobel_ksize)
+        gy = cv2.Sobel(d_uint8, cv2.CV_32F, 0, 1, ksize=cfg.depth_sobel_ksize)
+        mag = np.sqrt(gx * gx + gy * gy)
+        thr = np.percentile(mag, cfg.depth_edge_percentile)
+        edges = (mag >= thr).astype(np.uint8) * 255
+
+    # Step 7: Morphological closing to connect nearby edges
     edges = _morph_close(edges, cfg.morph_kernel)
+
+    # Step 8: Optional dilation to increase overlap with RGB edges
+    if cfg.depth_edge_dilate > 0:
+        kernel = np.ones((3, 3), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=cfg.depth_edge_dilate)
+
     return (edges > 0).astype(np.float32)
 
 
