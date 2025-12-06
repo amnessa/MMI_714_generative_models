@@ -160,26 +160,30 @@ class DepthInpaintDataset(Dataset):
         # normalize depth to [-1,1]
         depth_norm = _norm_depth(depth, *c.depth_minmax)
 
-        # build raw/corrupted depth with strong noise on mask
-        raw_full = corrupt_depth_normalized(depth_norm, mask, c.sigma_mask, c.sigma_global)
+        # -------------------------------------------------------------------
+        # DITR Preparation: Zero out depth inside masked (transparent) area
+        # No noise/corruption - just simulate missing depth from sensor
+        # -------------------------------------------------------------------
+        # Raw depth = normalized depth with transparent region zeroed out
+        raw_depth = depth_norm * (1.0 - mask)  # Zero inside mask (glass area)
 
         # -------------------------------------------------------------------
-        # CRITICAL FIX: Mask the conditioning Raw Depth based on branch logic
+        # Branch-specific conditioning
         # -------------------------------------------------------------------
         if c.branch == "optical":
-            # Track A: Optical Branch (Fixing Glass)
-            # Input: Raw Depth * Mask (Zero out background)
-            # Loss Mask: Mask (Calculate loss only on glass)
+            # Track A: Optical Branch (Inpaints Glass Region)
+            # Conditioning: RGB + raw_depth (zeroed in glass) + M_DA guidance
+            # Loss Mask: Mask (supervise only glass region)
             loss_mask = mask
-            cond_depth = raw_full * mask
+            cond_depth = raw_depth  # Already zeroed in glass area
             guide = m_da(rgb, depth, self.gcfg) if c.include_guidance else np.zeros_like(mask)
 
         else:  # geometric
-            # Track B: Geometric Branch (Fixing Background)
-            # Input: Raw Depth * (1 - Mask) (Zero out glass)
-            # Loss Mask: 1 - Mask (Calculate loss only on background)
+            # Track B: Geometric Branch (Refines Background)
+            # Conditioning: RGB + raw_depth + M_RGB guidance
+            # Loss Mask: 1 - Mask (supervise only background)
             loss_mask = 1.0 - mask
-            cond_depth = raw_full * (1.0 - mask)
+            cond_depth = raw_depth  # Same raw depth for geometric
             guide = m_rgb(rgb, self.gcfg) if c.include_guidance else np.zeros_like(mask)
 
         # to torch tensors

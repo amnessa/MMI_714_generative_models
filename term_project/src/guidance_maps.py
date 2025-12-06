@@ -7,7 +7,12 @@ import torch
 
 @dataclass
 class GuidanceConfig:
-    # Classic edge detection params (fallback)
+    # =========================================================================
+    # Edge detector selection: 'canny', 'sam', or 'pidinet'
+    # =========================================================================
+    edge_detector: Literal['canny', 'sam', 'pidinet'] = 'pidinet'
+
+    # Classic edge detection params (for edge_detector='canny')
     rgb_canny_thresh1: int = 100
     rgb_canny_thresh2: int = 200
     rgb_canny_aperture: int = 3
@@ -23,10 +28,10 @@ class GuidanceConfig:
     depth_canny_thresh2: int = 100        # Upper threshold for depth Canny
     depth_edge_dilate: int = 0            # Dilation iterations (0=none, 1-2 for more coverage)
 
-    # SAM configuration
+    # SAM configuration (for edge_detector='sam')
     # NOTE: SAM cannot run in DataLoader workers (CUDA context issues).
     # Enable SAM only for single-threaded/inference use or precomputation.
-    use_sam: bool = True                  # Master switch (if False, disables all SAM)
+    use_sam: bool = False                 # Legacy switch (use edge_detector='sam' instead)
     use_sam_rgb: bool = True              # Use SAM for RGB edges (high quality)
     use_sam_depth: bool = True            # Use SAM for depth edges (high quality)
     sam_model_name: str = "facebook/sam-vit-base"
@@ -34,6 +39,13 @@ class GuidanceConfig:
     sam_pred_iou_thresh: float = 0.88
     sam_stability_score_thresh: float = 0.95
     sam_device: str = "cuda"              # or "cpu"
+
+    # PiDiNet configuration (for edge_detector='pidinet')
+    pidinet_weights_path: Optional[str] = None  # Path to pretrained weights (.pth)
+    pidinet_threshold: float = 0.5              # Edge probability threshold
+    pidinet_device: str = "cuda"
+    pidinet_dilation: int = 24                  # CDCM dilation channels (must match pretrained weights)
+    pidinet_morph_erode: int = 1                # Erosion iterations to thin edges (0=disabled)
 
 
 # Global SAM model cache to avoid reloading
@@ -76,13 +88,15 @@ def _morph_close(bin_img: np.ndarray, k: int) -> np.ndarray:
 def _extract_boundaries_from_masks(masks: np.ndarray) -> Optional[np.ndarray]:
     """
     Extract boundary/edge map from a set of segmentation masks.
-    Handles inverted masks by checking which representation has more boundary pixels.
+
+    For each mask, we find the contour (boundary) and add it to the boundary map.
+    This gives us edges where segments meet, which is what we want for M_RGB and M_D.
 
     Args:
         masks: (N, H, W) binary masks
 
     Returns:
-        (H, W) boundary map where edges between segments are marked (always white=edge)
+        (H, W) boundary map where edges between segments are marked
     """
     if masks is None or len(masks) == 0:
         return None
@@ -91,29 +105,21 @@ def _extract_boundaries_from_masks(masks: np.ndarray) -> Optional[np.ndarray]:
     boundary_map = np.zeros((h, w), dtype=np.float32)
 
     for mask in masks:
-        # Normalize mask to binary (handle both 0-1 and 0-255 ranges)
+        # Normalize mask to binary uint8
         if mask.max() > 1:
-            mask_norm = mask / 255.0
+            mask_uint8 = (mask > 127).astype(np.uint8) * 255
         else:
-            mask_norm = mask
+            mask_uint8 = (mask > 0.5).astype(np.uint8) * 255
 
-        # Handle potential inversion: check which interpretation gives boundaries
-        # (not filled regions)
-        mask_uint8 = (mask_norm > 0.5).astype(np.uint8) * 255
+        # Find contours - these are the actual boundaries
+        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
-        # Use morphological gradient to find boundaries
-        kernel = np.ones((3, 3), np.uint8)
-        gradient = cv2.morphologyEx(mask_uint8, cv2.MORPH_GRADIENT, kernel)
+        # Draw contours as boundaries (1 pixel thick)
+        contour_img = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(contour_img, contours, -1, 255, thickness=1)
 
-        # If the gradient is mostly filled (>30% of image), the mask might be inverted
-        # In that case, we should use the inverse
-        fill_ratio = gradient.sum() / (h * w * 255)
-        if fill_ratio > 0.3:
-            # Likely inverted - use inverse mask
-            mask_uint8_inv = ((1.0 - mask_norm) > 0.5).astype(np.uint8) * 255
-            gradient = cv2.morphologyEx(mask_uint8_inv, cv2.MORPH_GRADIENT, kernel)
-
-        boundary_map = np.maximum(boundary_map, gradient.astype(np.float32) / 255.0)
+        # Add to boundary map
+        boundary_map = np.maximum(boundary_map, contour_img.astype(np.float32) / 255.0)
 
     return boundary_map
 
@@ -193,6 +199,10 @@ def sam_edges_rgb(rgb: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
 
     all_masks = np.array(all_masks)
     boundary_map = _extract_boundaries_from_masks(all_masks)
+
+    if boundary_map is None:
+        return rgb_edges(rgb, cfg)
+
     boundary_map = _morph_close((boundary_map * 255).astype(np.uint8), cfg.morph_kernel)
     boundary_map = (boundary_map > 0).astype(np.float32)
 
@@ -287,6 +297,11 @@ def sam_edges_depth(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
 
     all_masks = np.array(all_masks)
     boundary_map = _extract_boundaries_from_masks(all_masks)
+
+    # Fallback if boundary extraction fails
+    if boundary_map is None:
+        return depth_edges(depth, cfg)
+
     boundary_map = _morph_close((boundary_map * 255).astype(np.uint8), cfg.morph_kernel)
     boundary_map = (boundary_map > 0).astype(np.float32)
 
@@ -392,48 +407,139 @@ def depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
 # Main guidance map functions
 # ============================================================================
 
+def _get_rgb_edges(rgb_bgr: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
+    """Get RGB edges using the configured edge detector."""
+    if cfg.edge_detector == 'pidinet':
+        try:
+            from pidinet_edges import pidinet_edges_rgb, PiDiNetConfig
+            pidi_cfg = PiDiNetConfig(
+                model_path=cfg.pidinet_weights_path,
+                device=cfg.pidinet_device,
+                dilation=cfg.pidinet_dilation,
+                threshold=cfg.pidinet_threshold,
+                morph_erode=cfg.pidinet_morph_erode,
+                depth_max_distance=cfg.depth_max_distance,
+                depth_use_inverse=cfg.depth_use_inverse,
+            )
+            return pidinet_edges_rgb(rgb_bgr, pidi_cfg)
+        except ImportError:
+            print("WARNING: PiDiNet not available, falling back to Canny")
+            return rgb_edges(rgb_bgr, cfg)
+    elif cfg.edge_detector == 'sam' or (cfg.use_sam and cfg.use_sam_rgb):
+        return sam_edges_rgb(rgb_bgr, cfg)
+    else:
+        return rgb_edges(rgb_bgr, cfg)
+
+
+def _get_depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
+    """Get depth edges using the configured edge detector."""
+    if cfg.edge_detector == 'pidinet':
+        try:
+            from pidinet_edges import pidinet_edges_depth, PiDiNetConfig
+            pidi_cfg = PiDiNetConfig(
+                model_path=cfg.pidinet_weights_path,
+                device=cfg.pidinet_device,
+                dilation=cfg.pidinet_dilation,
+                threshold=cfg.pidinet_threshold,
+                morph_erode=cfg.pidinet_morph_erode,
+                depth_max_distance=cfg.depth_max_distance,
+                depth_use_inverse=cfg.depth_use_inverse,
+            )
+            return pidinet_edges_depth(depth, pidi_cfg)
+        except ImportError:
+            print("WARNING: PiDiNet not available, falling back to Canny")
+            return depth_edges(depth, cfg)
+    elif cfg.edge_detector == 'sam' or (cfg.use_sam and cfg.use_sam_depth):
+        return sam_edges_depth(depth, cfg)
+    else:
+        return depth_edges(depth, cfg)
+
+
 def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig,
-         mask: Optional[np.ndarray] = None) -> np.ndarray:
+         mask: Optional[np.ndarray] = None,
+         zeroed_depth: Optional[np.ndarray] = None,
+         fallback_threshold: float = 0.01) -> np.ndarray:
     """
     Depth-Aware boundary map for OPTICAL inpainting (Track A).
 
     Per DITR paper: M_DA = M_RGB \\\\ C_U(M_D) = M_RGB ∩ M_D (INTERSECTION)
 
-    Mathematical proof:
-        M_DA = M_RGB \\\\ C_U(M_D)  where C_U is complement
-        A \\\\ B^c = A ∩ B
+    - M_RGB: Edges from RGB image (sees transparent objects + background)
+    - M_D: Edges from depth image (sees background THROUGH transparent objects)
+    - M_DA: Intersection = edges that are confirmed in both modalities
 
-    This finds edges that appear in BOTH RGB and Depth ("confirmed" real boundaries).
-    Edges only in RGB (not in M_DA) are likely transparent/reflective ghost edges.
+    IMPORTANT: For depth edge detection, use `zeroed_depth` (depth with transparent
+    region set to 0) to get edges of what's visible through/behind the glass.
+
+    Safety Net: If M_DA < 1% of mask pixels, fallback to whichever has more
+    edge pixels (M_RGB or M_D). This prevents guidance map being empty/useless.
 
     Args:
         rgb_bgr: (H, W, 3) BGR image
-        depth: (H, W) depth map
+        depth: (H, W) raw depth map (used if zeroed_depth not provided)
         cfg: GuidanceConfig
         mask: Optional (H, W) mask where 1=transparent area
+        zeroed_depth: Optional (H, W) depth with transparent region zeroed out.
+                      If provided, this is used for depth edge detection.
+        fallback_threshold: Minimum ratio of M_DA pixels to mask pixels (default 1%)
 
     Returns:
         (H, W) guidance map - intersection of RGB and Depth edges, masked to transparent region
     """
-    # RGB edges: use SAM if enabled for RGB
-    if cfg.use_sam and cfg.use_sam_rgb:
-        e_rgb = sam_edges_rgb(rgb_bgr, cfg)
-    else:
-        e_rgb = rgb_edges(rgb_bgr, cfg)
+    # Get RGB edges (sees everything including transparent object boundaries)
+    e_rgb = _get_rgb_edges(rgb_bgr, cfg)
 
-    # Depth edges: use SAM if enabled for depth
-    if cfg.use_sam and cfg.use_sam_depth:
-        e_d = sam_edges_depth(depth, cfg)
-    else:
-        e_d = depth_edges(depth, cfg)
+    # Get Depth edges from zeroed depth (sees background through glass)
+    # Use zeroed_depth if provided, otherwise use raw depth
+    depth_for_edges = zeroed_depth if zeroed_depth is not None else depth
+    e_d = _get_depth_edges(depth_for_edges, cfg)
 
-    # M_DA = M_RGB ∩ M_D (INTERSECTION, not difference!)
+    # M_DA = M_RGB ∩ M_D (INTERSECTION)
     # This gives us edges that are confirmed in both modalities
-    out = np.minimum(e_rgb, e_d)  # Intersection for binary maps
+    mda_raw = np.minimum(e_rgb, e_d)  # Intersection for binary maps
 
     # Apply mask: guidance only inside transparent region
     if mask is not None:
-        out = out * mask
+        mda_masked = mda_raw * mask
+        e_rgb_masked = e_rgb * mask
+        e_d_masked = e_d * mask
+
+        # =====================================================================
+        # SAFETY NET: Fallback if intersection is too sparse
+        # If M_DA has less than 1% of mask pixels, use M_RGB or M_D as fallback
+        # =====================================================================
+        mask_pixel_count = mask.sum()
+        mda_pixel_count = mda_masked.sum()
+
+        if mask_pixel_count > 0:
+            mda_ratio = mda_pixel_count / mask_pixel_count
+
+            if mda_ratio < fallback_threshold:
+                # Intersection is too sparse, need fallback
+                e_rgb_count = e_rgb_masked.sum()
+                e_d_count = e_d_masked.sum()
+
+                if e_rgb_count > 0 or e_d_count > 0:
+                    # Use whichever has more edge pixels inside mask
+                    if e_rgb_count >= e_d_count:
+                        out = e_rgb_masked
+                        # Optionally log this for debugging
+                        # print(f"M_DA fallback: using M_RGB ({e_rgb_count:.0f} px > M_D {e_d_count:.0f} px)")
+                    else:
+                        out = e_d_masked
+                        # print(f"M_DA fallback: using M_D ({e_d_count:.0f} px > M_RGB {e_rgb_count:.0f} px)")
+                else:
+                    # Both M_RGB and M_D have zero pixels in mask - do nothing (return zeros)
+                    out = mda_masked  # Will be all zeros
+            else:
+                # Intersection is sufficient, use it
+                out = mda_masked
+        else:
+            # No mask pixels (shouldn't happen, but handle gracefully)
+            out = mda_masked
+    else:
+        # No mask provided, return raw intersection
+        out = mda_raw
 
     return out.astype(np.float32)
 
@@ -451,11 +557,8 @@ def m_rgb(rgb_bgr: np.ndarray, cfg: GuidanceConfig,
     Returns:
         (H, W) guidance map, optionally masked to background region only
     """
-    # RGB edges: use SAM if enabled for RGB
-    if cfg.use_sam and cfg.use_sam_rgb:
-        edges = sam_edges_rgb(rgb_bgr, cfg)
-    else:
-        edges = rgb_edges(rgb_bgr, cfg)
+    # Get RGB edges using configured detector
+    edges = _get_rgb_edges(rgb_bgr, cfg)
 
     # Apply inverse mask: guidance only outside transparent region (background)
     if mask is not None:

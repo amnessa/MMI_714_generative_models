@@ -63,7 +63,10 @@ def visualize_depth_processing(rgb, depth, mask, cfg: GuidanceConfig, title=""):
 
     # Always compute Canny edges for comparison
     e_rgb_canny = rgb_edges(rgb, cfg)
-    e_depth_canny = depth_edges(depth, cfg)
+
+    # Create zeroed depth for depth edge detection
+    zeroed_depth = depth * (1.0 - mask)
+    e_depth_canny = depth_edges(zeroed_depth, cfg)
 
     # Compute SAM edges if enabled
     if cfg.use_sam and cfg.use_sam_rgb:
@@ -72,12 +75,12 @@ def visualize_depth_processing(rgb, depth, mask, cfg: GuidanceConfig, title=""):
         e_rgb_sam = None
 
     if cfg.use_sam and cfg.use_sam_depth:
-        e_depth_sam = sam_edges_depth(depth, cfg)
+        e_depth_sam = sam_edges_depth(zeroed_depth, cfg)
     else:
         e_depth_sam = None
 
-    # Compute M_DA and M_RGB (these use SAM or Canny based on config)
-    mda = m_da(rgb, depth, cfg, mask)
+    # Compute M_DA and M_RGB using the m_da function (includes safety net)
+    mda = m_da(rgb, depth, cfg, mask, zeroed_depth=zeroed_depth)
     mrgb = m_rgb(rgb, cfg, mask)
 
     # Determine which edges are actually being used
@@ -174,7 +177,6 @@ def visualize_depth_processing(rgb, depth, mask, cfg: GuidanceConfig, title=""):
 
     plt.tight_layout()
     safe_title = title.replace(' ', '_').replace('/', '_')
-    plt.savefig(f"debug_edges_{safe_title}.png", dpi=150)
     plt.show()
 
     return e_rgb_used, e_depth_used, mda, mrgb

@@ -5,10 +5,12 @@ import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
-from guidance_maps import sam_edges_rgb, sam_edges_depth, m_da, m_rgb, GuidanceConfig
+from guidance_maps import m_da, m_rgb, GuidanceConfig
 
 # Configuration
 DATASET_ROOT = "/home/cago/MMI_714_generative_models/term_project/dataset/cleargrasp-dataset-train-resized/"
+WEIGHTS_PATH = "/home/cago/MMI_714_generative_models/term_project/src/weights/table5_pidinet.pth"
+
 # Output folders (will be created)
 GUIDANCE_DIR_OPT = "guidance-optical-mda"
 GUIDANCE_DIR_GEO = "guidance-geometric-mrgb"
@@ -16,35 +18,38 @@ GUIDANCE_DIR_GEO = "guidance-geometric-mrgb"
 # Image size
 IMG_SIZE = (128, 128)
 
-def process_dataset(use_sam_rgb: bool = False, use_sam_depth: bool = False):
+
+def process_dataset(edge_detector: str = 'pidinet'):
     """
     Pre-compute guidance maps for the entire dataset.
 
     Args:
-        use_sam_rgb: If True, use SAM for RGB edge detection (high quality).
-        use_sam_depth: If True, use SAM for depth edge detection (high quality).
-                       If False, use robust Canny with inverse depth.
+        edge_detector: 'pidinet', 'canny', or 'sam'
     """
-    use_sam = use_sam_rgb or use_sam_depth
-
-    # Setup config with robust depth preprocessing
+    # Setup config
     cfg = GuidanceConfig(
-        use_sam=use_sam,
-        use_sam_rgb=use_sam_rgb,
-        use_sam_depth=use_sam_depth,
-        sam_device="cuda" if use_sam else "cpu",
+        edge_detector=edge_detector,
+        # PiDiNet settings
+        pidinet_weights_path=WEIGHTS_PATH if edge_detector == 'pidinet' else None,
+        pidinet_device="cuda",
+        pidinet_threshold=0.5,
+        # SAM settings (for edge_detector='sam')
+        use_sam=edge_detector == 'sam',
+        use_sam_rgb=True,
+        use_sam_depth=True,
+        sam_device="cuda",
         sam_model_name="facebook/sam-vit-base",
-        # Robust depth settings (used when use_sam_depth=False)
+        # Robust depth settings (used for all methods)
         depth_max_distance=10.0,
         depth_use_inverse=True,
         depth_use_canny=True,
         depth_canny_thresh1=30,
         depth_canny_thresh2=100,
-        depth_edge_dilate=0,  # No dilation for better M_DA
+        depth_edge_dilate=0,
     )
 
-    print(f"Config: use_sam_rgb={use_sam_rgb}, use_sam_depth={use_sam_depth}")
-    print(f"        inverse_depth={cfg.depth_use_inverse}")
+    print(f"Edge detector: {edge_detector}")
+    print(f"Depth preprocessing: inverse_depth={cfg.depth_use_inverse}")
 
     # Walk through dataset - exclude hidden and output folders
     class_folders = [
@@ -117,9 +122,14 @@ def process_dataset(use_sam_rgb: bool = False, use_sam_depth: bool = False):
                 mask = cv2.resize(mask, IMG_SIZE, interpolation=cv2.INTER_NEAREST)
                 mask = (mask > 127).astype(np.float32)
 
+                # Create zeroed depth (transparent region set to 0)
+                # This is what the depth sensor "sees through" the glass
+                zeroed_depth = depth * (1.0 - mask)
+
                 # 2. Compute Guidance Maps
                 # M_DA for Optical (Masked to glass)
-                guidance_opt = m_da(rgb, depth, cfg, mask)
+                # Uses zeroed_depth for depth edges to see background through glass
+                guidance_opt = m_da(rgb, depth, cfg, mask, zeroed_depth=zeroed_depth)
 
                 # M_RGB for Geometric (Masked to background)
                 guidance_geo = m_rgb(rgb, cfg, mask)
@@ -143,17 +153,12 @@ def process_dataset(use_sam_rgb: bool = False, use_sam_depth: bool = False):
 
 if __name__ == "__main__":
     import argparse
+    from typing import Literal
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--use-sam-rgb", action="store_true",
-                        help="Use SAM for RGB edge detection (high quality)")
-    parser.add_argument("--use-sam-depth", action="store_true",
-                        help="Use SAM for depth edge detection (high quality)")
-    parser.add_argument("--use-sam", action="store_true",
-                        help="Use SAM for both RGB and depth (shortcut)")
+    parser.add_argument("--edge-detector", type=str, default="pidinet",
+                        choices=["pidinet", "canny", "sam"],
+                        help="Edge detector to use: pidinet (default), canny, or sam")
     args = parser.parse_args()
 
-    # --use-sam enables both
-    use_sam_rgb = args.use_sam or args.use_sam_rgb
-    use_sam_depth = args.use_sam or args.use_sam_depth
-
-    process_dataset(use_sam_rgb=use_sam_rgb, use_sam_depth=use_sam_depth)
+    process_dataset(edge_detector=args.edge_detector)
