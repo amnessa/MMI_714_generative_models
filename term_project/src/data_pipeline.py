@@ -222,8 +222,9 @@ class DepthInpaintDataset(Dataset):
         if c.branch == "optical":
             # Track A: Optical Branch (Inpaints Glass Region)
             # Conditioning: RGB + raw_depth (zeroed in glass) + M_DA guidance
-            # Loss Mask: Mask (supervise only glass region)
-            loss_mask = mask
+            # Mask: Used for inference merging only (not for loss weighting)
+            # Both models train on FULL depth image - conditioning differentiates them
+            loss_mask = mask  # Kept for inference merging
             cond_depth = raw_depth  # Already zeroed in glass area
             if guide is None and c.include_guidance:
                 # Fallback: compute on-the-fly
@@ -235,8 +236,9 @@ class DepthInpaintDataset(Dataset):
         else:  # geometric
             # Track B: Geometric Branch (Refines Background)
             # Conditioning: RGB + raw_depth + M_RGB guidance
-            # Loss Mask: 1 - Mask (supervise only background)
-            loss_mask = 1.0 - mask
+            # Mask: Used for inference merging only (not for loss weighting)
+            # Both models train on FULL depth image - conditioning differentiates them
+            loss_mask = 1.0 - mask  # Kept for inference merging
             cond_depth = raw_depth  # Same raw depth for geometric
             if guide is None and c.include_guidance:
                 # Fallback: compute on-the-fly
@@ -257,8 +259,8 @@ class DepthInpaintDataset(Dataset):
         cond = torch.cat([rgb_t, cond_depth_t, guide_t], dim=0)
 
         batch = {
-            "pixel_values": depth_t,        # target clean depth
-            "conditioning": cond,           # RGB + Masked Raw + Guidance
-            "loss_mask": loss_mask_t,      # region-specific supervision
+            "pixel_values": depth_t,        # target clean depth (FULL image)
+            "conditioning": cond,           # RGB + Masked Raw + Guidance (branch-specific)
+            "loss_mask": loss_mask_t,      # mask for inference merging (not used in loss)
         }
         return batch

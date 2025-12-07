@@ -107,15 +107,10 @@ class GaussianDiffusion(nn.Module):
         # model predicts noise given noisy depth and conditioning
         model_out = self.model(x_noisy, cond, t)
 
-        # masked MSE if provided
+        # Simple MSE loss on FULL image - both models learn full depth prediction
+        # The conditioning is what differentiates the branches, not the loss region
         err = (noise - model_out) ** 2
-        loss_mask = batch.get("loss_mask", None)
-        if loss_mask is not None:
-            loss_mask = loss_mask.to(err.device)
-            # Add small epsilon to denominator to prevent NaN if mask is empty
-            loss = (err * loss_mask).sum() / (loss_mask.sum() + 1e-8)
-        else:
-            loss = err.mean()
+        loss = err.mean()
         return loss
 
     # ---------------------------------------------------------------------
