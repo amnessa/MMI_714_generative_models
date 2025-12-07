@@ -24,6 +24,8 @@ class DepthDataConfig:
     rgb_dir: str = "rgb-imgs"
     depth_dir: str = "depth-imgs-rectified"
     mask_dir: str = "segmentation-masks"  # binary mask for transparent areas (1=transparent)
+    guidance_optical_dir: str = "guidance-optical-mda"  # Pre-computed M_DA maps
+    guidance_geometric_dir: str = "guidance-geometric-mrgb"  # Pre-computed M_RGB maps
     size: Tuple[int, int] = (128, 128)
     depth_minmax: Tuple[float, float] = (0.0, 3.0)
     # noise parameters in normalized depth space [-1, 1]
@@ -31,6 +33,7 @@ class DepthDataConfig:
     sigma_global: float = 0.01 # light noise overall
     branch: Literal["optical", "geometric"] = "optical"
     include_guidance: bool = True
+    use_precomputed_guidance: bool = True  # Use pre-computed maps if available
 
 
 
@@ -104,39 +107,66 @@ class DepthInpaintDataset(Dataset):
         self.rgb_paths: List[str] = []
         self.depth_paths: List[str] = []
         self.mask_paths: List[str] = []
+        self.guidance_paths: List[str] = []  # Pre-computed guidance maps
+
+        # Determine which guidance folder to use based on branch
+        guidance_dir_name = cfg.guidance_optical_dir if cfg.branch == "optical" else cfg.guidance_geometric_dir
 
         if os.path.isdir(flat_rgb) and os.path.isdir(flat_depth) and os.path.isdir(flat_mask):
             self.rgb_paths = self._collect(flat_rgb, IMG_EXTS)
             self.depth_paths = self._collect(flat_depth, DEPTH_EXTS)
             self.mask_paths = self._collect(flat_mask, MASK_EXTS)
+            # Check for flat guidance folder
+            flat_guidance = os.path.join(cfg.root, guidance_dir_name)
+            if os.path.isdir(flat_guidance):
+                self.guidance_paths = self._collect(flat_guidance, IMG_EXTS)
         else:
             # Fallback for nested structure (class/folder/...)
             if not os.path.isdir(cfg.root):
                 raise RuntimeError(f"Root directory does not exist: {cfg.root}")
 
-            class_folders = [os.path.join(cfg.root, d) for d in os.listdir(cfg.root) if os.path.isdir(os.path.join(cfg.root, d))]
+            class_folders = [os.path.join(cfg.root, d) for d in os.listdir(cfg.root)
+                           if os.path.isdir(os.path.join(cfg.root, d))
+                           and not d.startswith("guidance")]  # Skip guidance folders at root
             class_folders.sort()
 
             for cf in class_folders:
                 rgb_dir = os.path.join(cf, cfg.rgb_dir)
                 depth_dir = os.path.join(cf, cfg.depth_dir)
                 mask_dir = os.path.join(cf, cfg.mask_dir)
+                guidance_dir = os.path.join(cf, guidance_dir_name)
+
                 if not (os.path.isdir(rgb_dir) and os.path.isdir(depth_dir) and os.path.isdir(mask_dir)):
                     continue
                 rgbs = self._collect(rgb_dir, IMG_EXTS)
                 depths = self._collect(depth_dir, DEPTH_EXTS)
                 masks = self._collect(mask_dir, MASK_EXTS)
+                guides = self._collect(guidance_dir, IMG_EXTS) if os.path.isdir(guidance_dir) else []
+
                 n_local = min(len(rgbs), len(depths), len(masks))
                 if n_local == 0:
                     continue
                 self.rgb_paths.extend(rgbs[:n_local])
                 self.depth_paths.extend(depths[:n_local])
                 self.mask_paths.extend(masks[:n_local])
+                # Extend guidance paths, padding with empty strings if not available
+                if len(guides) >= n_local:
+                    self.guidance_paths.extend(guides[:n_local])
+                else:
+                    self.guidance_paths.extend(guides + [""] * (n_local - len(guides)))
 
         n = min(len(self.rgb_paths), len(self.depth_paths), len(self.mask_paths))
         self.rgb_paths = self.rgb_paths[:n]
         self.depth_paths = self.depth_paths[:n]
         self.mask_paths = self.mask_paths[:n]
+        self.guidance_paths = self.guidance_paths[:n] if self.guidance_paths else [""] * n
+
+        # Check if we have pre-computed guidance
+        self.has_precomputed = len(self.guidance_paths) > 0 and self.guidance_paths[0] != ""
+        if self.has_precomputed and cfg.use_precomputed_guidance:
+            print(f"[INFO] Using pre-computed {cfg.branch} guidance maps from '{guidance_dir_name}/'")
+        elif cfg.include_guidance:
+            print(f"[INFO] Computing {cfg.branch} guidance maps on-the-fly (slower)")
 
         if n == 0:
             print(f"[WARNING] No data found in {cfg.root}. Check folder structure.")
@@ -150,6 +180,20 @@ class DepthInpaintDataset(Dataset):
 
     def __len__(self):
         return len(self.rgb_paths)
+
+    def _load_precomputed_guidance(self, idx: int, size: Tuple[int, int]) -> Optional[np.ndarray]:
+        """Load pre-computed guidance map if available."""
+        if idx >= len(self.guidance_paths) or not self.guidance_paths[idx]:
+            return None
+        path = self.guidance_paths[idx]
+        if not os.path.exists(path):
+            return None
+        guide = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if guide is None:
+            return None
+        guide = cv2.resize(guide, size, interpolation=cv2.INTER_NEAREST)
+        guide = guide.astype(np.float32) / 255.0  # [0, 1]
+        return guide
 
     def __getitem__(self, idx: int):
         c = self.cfg
@@ -170,13 +214,23 @@ class DepthInpaintDataset(Dataset):
         # -------------------------------------------------------------------
         # Branch-specific conditioning
         # -------------------------------------------------------------------
+        # Try to load pre-computed guidance first
+        guide = None
+        if c.use_precomputed_guidance and self.has_precomputed:
+            guide = self._load_precomputed_guidance(idx, c.size)
+
         if c.branch == "optical":
             # Track A: Optical Branch (Inpaints Glass Region)
             # Conditioning: RGB + raw_depth (zeroed in glass) + M_DA guidance
             # Loss Mask: Mask (supervise only glass region)
             loss_mask = mask
             cond_depth = raw_depth  # Already zeroed in glass area
-            guide = m_da(rgb, depth, self.gcfg) if c.include_guidance else np.zeros_like(mask)
+            if guide is None and c.include_guidance:
+                # Fallback: compute on-the-fly
+                zeroed_depth = depth * (1.0 - mask)
+                guide = m_da(rgb, depth, self.gcfg, mask, zeroed_depth=zeroed_depth)
+            elif guide is None:
+                guide = np.zeros_like(mask)
 
         else:  # geometric
             # Track B: Geometric Branch (Refines Background)
@@ -184,7 +238,11 @@ class DepthInpaintDataset(Dataset):
             # Loss Mask: 1 - Mask (supervise only background)
             loss_mask = 1.0 - mask
             cond_depth = raw_depth  # Same raw depth for geometric
-            guide = m_rgb(rgb, self.gcfg) if c.include_guidance else np.zeros_like(mask)
+            if guide is None and c.include_guidance:
+                # Fallback: compute on-the-fly
+                guide = m_rgb(rgb, self.gcfg, mask)
+            elif guide is None:
+                guide = np.zeros_like(mask)
 
         # to torch tensors
         rgb_t = torch.from_numpy(rgb[:, :, ::-1].copy()).float() / 255.0  # CHW
