@@ -335,7 +335,7 @@ def convert_pidinet_checkpoint(state_dict: dict, config: str = 'carv4') -> dict:
 class PiDiNetConfig:
     """Configuration for PiDiNet edge detector."""
     # Model settings
-    model_path: Optional[str] = None  # Path to pretrained weights
+    model_path: Optional[str] = os.path.join(os.path.dirname(__file__), "weights", "table5_pidinet.pth")
     device: str = "cuda"
     dilation: int = 24      # CDCM dilation channels (must match pretrained weights = 24)
 
@@ -635,9 +635,8 @@ if __name__ == "__main__":
     test_img = np.random.randint(0, 255, (128, 128, 3), dtype=np.uint8)
     test_depth = np.random.rand(128, 128).astype(np.float32) * 5.0
 
-    # Initialize config (no pretrained weights for quick test)
+    # Initialize config (uses default pretrained weights path)
     cfg = PiDiNetConfig(
-        model_path=None,
         device="cuda" if torch.cuda.is_available() else "cpu",
         threshold=0.5,
     )

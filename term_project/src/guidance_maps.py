@@ -412,8 +412,8 @@ def _get_rgb_edges(rgb_bgr: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
     if cfg.edge_detector == 'pidinet':
         try:
             from pidinet_edges import pidinet_edges_rgb, PiDiNetConfig
-            pidi_cfg = PiDiNetConfig(
-                model_path=cfg.pidinet_weights_path,
+            # Only pass model_path if explicitly set, otherwise use PiDiNetConfig default
+            pidi_kwargs = dict(
                 device=cfg.pidinet_device,
                 dilation=cfg.pidinet_dilation,
                 threshold=cfg.pidinet_threshold,
@@ -421,6 +421,9 @@ def _get_rgb_edges(rgb_bgr: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
                 depth_max_distance=cfg.depth_max_distance,
                 depth_use_inverse=cfg.depth_use_inverse,
             )
+            if cfg.pidinet_weights_path is not None:
+                pidi_kwargs['model_path'] = cfg.pidinet_weights_path
+            pidi_cfg = PiDiNetConfig(**pidi_kwargs)
             return pidinet_edges_rgb(rgb_bgr, pidi_cfg)
         except ImportError:
             print("WARNING: PiDiNet not available, falling back to Canny")
@@ -436,8 +439,8 @@ def _get_depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
     if cfg.edge_detector == 'pidinet':
         try:
             from pidinet_edges import pidinet_edges_depth, PiDiNetConfig
-            pidi_cfg = PiDiNetConfig(
-                model_path=cfg.pidinet_weights_path,
+            # Only pass model_path if explicitly set, otherwise use PiDiNetConfig default
+            pidi_kwargs = dict(
                 device=cfg.pidinet_device,
                 dilation=cfg.pidinet_dilation,
                 threshold=cfg.pidinet_threshold,
@@ -445,6 +448,9 @@ def _get_depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
                 depth_max_distance=cfg.depth_max_distance,
                 depth_use_inverse=cfg.depth_use_inverse,
             )
+            if cfg.pidinet_weights_path is not None:
+                pidi_kwargs['model_path'] = cfg.pidinet_weights_path
+            pidi_cfg = PiDiNetConfig(**pidi_kwargs)
             return pidinet_edges_depth(depth, pidi_cfg)
         except ImportError:
             print("WARNING: PiDiNet not available, falling back to Canny")
