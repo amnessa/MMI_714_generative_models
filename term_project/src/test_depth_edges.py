@@ -297,6 +297,10 @@ def main():
                         help="Sample indices to test per class")
     parser.add_argument("--fallback-threshold", type=float, default=0.01,
                         help="Safety net threshold (default 1%% of mask pixels)")
+    parser.add_argument("--compare-enhanced", action="store_true",
+                        help="Show comparison between enhanced and original Canny")
+    parser.add_argument("--no-enhanced", action="store_true",
+                        help="Disable enhanced Canny (use original simple Canny)")
     args = parser.parse_args()
 
     # SAM is now the DEFAULT - use --no-sam to disable
@@ -333,6 +337,14 @@ def main():
         depth_use_canny=True,
         depth_canny_thresh1=30,
         depth_canny_thresh2=100,
+        # Enhanced Canny options
+        rgb_use_enhanced=not args.no_enhanced,
+        rgb_enhance_clahe=True,
+        rgb_clahe_clip=2.0,
+        rgb_use_lab_channel=False,
+        rgb_use_saturation=False,
+        rgb_multi_scale=False,
+        rgb_gradient_magnitude=False,
     )
 
     print("Testing edge extraction...")
@@ -342,6 +354,7 @@ def main():
     print(f"        sam_combine_with_canny={cfg.sam_combine_with_canny}, sam_use_all_masks={cfg.sam_use_all_masks}")
     print(f"        inverse_depth={cfg.depth_use_inverse}, canny={cfg.depth_use_canny}")
     print(f"        fallback_threshold={args.fallback_threshold*100:.1f}%")
+    print(f"        rgb_use_enhanced={cfg.rgb_use_enhanced}")
 
     # Get list of class folders
     class_folders = [f for f in os.listdir(DATASET_ROOT)
@@ -358,6 +371,11 @@ def main():
         for idx in args.samples_per_class:
             try:
                 rgb, depth, mask, fname = load_sample(class_name, idx)
+
+                # Optional: Show enhanced vs original comparison
+                if args.compare_enhanced:
+                    compare_enhanced_canny(rgb, mask, cfg, f"{class_name} - {fname}")
+
                 visualize_depth_processing(
                     rgb, depth, mask, cfg,
                     title=f"{class_name} - {fname}",
@@ -366,6 +384,88 @@ def main():
             except Exception as e:
                 print(f"  Sample {idx} failed: {e}")
                 continue
+
+
+def compare_enhanced_canny(rgb, mask, cfg: GuidanceConfig, title=""):
+    """Compare enhanced vs original Canny edge detection for M_RGB."""
+
+    # Original simple Canny
+    cfg_original = GuidanceConfig(
+        rgb_use_enhanced=False,
+        rgb_canny_thresh1=cfg.rgb_canny_thresh1,
+        rgb_canny_thresh2=cfg.rgb_canny_thresh2,
+    )
+    edges_original = rgb_edges(rgb, cfg_original)
+    mrgb_original = edges_original * (1.0 - mask)
+
+    # Enhanced Canny
+    cfg_enhanced = GuidanceConfig(
+        rgb_use_enhanced=True,
+        rgb_enhance_clahe=True,
+        rgb_clahe_clip=3.0,
+        rgb_use_lab_channel=True,
+        rgb_use_saturation=True,
+        rgb_multi_scale=True,
+        rgb_gradient_magnitude=True,
+    )
+    edges_enhanced = rgb_edges(rgb, cfg_enhanced)
+    mrgb_enhanced = edges_enhanced * (1.0 - mask)
+
+    # Stats
+    print(f"\n{'='*60}")
+    print(f"Enhanced vs Original Canny Comparison: {title}")
+    print(f"{'='*60}")
+    print(f"  Original Canny edges:  {edges_original.sum():.0f} px")
+    print(f"  Enhanced Canny edges:  {edges_enhanced.sum():.0f} px ({edges_enhanced.sum()/max(edges_original.sum(),1)*100:.1f}% of original)")
+    print(f"  Original M_RGB:        {mrgb_original.sum():.0f} px (background)")
+    print(f"  Enhanced M_RGB:        {mrgb_enhanced.sum():.0f} px (background)")
+
+    # Also check inside transparent region
+    edges_orig_glass = (edges_original * mask).sum()
+    edges_enh_glass = (edges_enhanced * mask).sum()
+    print(f"  Original in glass:     {edges_orig_glass:.0f} px")
+    print(f"  Enhanced in glass:     {edges_enh_glass:.0f} px ({edges_enh_glass/max(edges_orig_glass,1)*100:.1f}% of original)")
+
+    # Visualize
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    fig.suptitle(f"Enhanced vs Original Canny: {title}", fontsize=14)
+
+    # Row 1: Original
+    axes[0, 0].imshow(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
+    axes[0, 0].set_title("RGB Input")
+    axes[0, 0].axis('off')
+
+    axes[0, 1].imshow(edges_original, cmap='gray')
+    axes[0, 1].set_title(f"Original Canny\n({edges_original.sum():.0f} px)")
+    axes[0, 1].axis('off')
+
+    axes[0, 2].imshow(mrgb_original, cmap='hot')
+    axes[0, 2].set_title(f"Original M_RGB\n({mrgb_original.sum():.0f} px)")
+    axes[0, 2].axis('off')
+
+    axes[0, 3].imshow(edges_original * mask, cmap='hot')
+    axes[0, 3].set_title(f"Original in Glass\n({edges_orig_glass:.0f} px)")
+    axes[0, 3].axis('off')
+
+    # Row 2: Enhanced
+    axes[1, 0].imshow(mask, cmap='gray')
+    axes[1, 0].set_title(f"Mask (glass={mask.sum():.0f}px)")
+    axes[1, 0].axis('off')
+
+    axes[1, 1].imshow(edges_enhanced, cmap='gray')
+    axes[1, 1].set_title(f"Enhanced Canny\n({edges_enhanced.sum():.0f} px)")
+    axes[1, 1].axis('off')
+
+    axes[1, 2].imshow(mrgb_enhanced, cmap='hot')
+    axes[1, 2].set_title(f"Enhanced M_RGB\n({mrgb_enhanced.sum():.0f} px)")
+    axes[1, 2].axis('off')
+
+    axes[1, 3].imshow(edges_enhanced * mask, cmap='hot')
+    axes[1, 3].set_title(f"Enhanced in Glass\n({edges_enh_glass:.0f} px)")
+    axes[1, 3].axis('off')
+
+    plt.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":

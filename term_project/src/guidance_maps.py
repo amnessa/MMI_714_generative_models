@@ -20,6 +20,19 @@ class GuidanceConfig:
     depth_edge_percentile: float = 90.0
     morph_kernel: int = 3
 
+    # Enhanced edge detection for transparent objects (for edge_detector='canny')
+    rgb_use_enhanced: bool = True         # Use multi-channel enhanced edge detection
+    rgb_enhance_clahe: bool = True        # Apply CLAHE for local contrast enhancement
+    rgb_clahe_clip: float = 2.0           # CLAHE clip limit (higher = more contrast)
+    rgb_clahe_grid: int = 8               # CLAHE tile grid size
+    rgb_use_lab_channel: bool = True      # Use LAB L-channel (better for glass)
+    rgb_use_saturation: bool = False      # Use HSV saturation channel (can be noisy)
+    rgb_multi_scale: bool = False         # Combine edges at multiple Canny thresholds
+    rgb_canny_low_thresh1: int = 50       # Lower threshold pair for subtle edges
+    rgb_canny_low_thresh2: int = 100
+    rgb_gradient_magnitude: bool = False  # Also use gradient magnitude thresholding
+    rgb_gradient_percentile: float = 90.0 # Percentile for gradient thresholding (higher = fewer edges)
+
     # Robust depth preprocessing
     depth_max_distance: float = 10.0      # Far plane clamp (meters)
     depth_use_inverse: bool = True        # Use 1/z (disparity) for better near-object edges
@@ -368,15 +381,143 @@ def sam_edges_depth(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
 # ============================================================================
 
 def rgb_edges(rgb_bgr: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
-    """Classical Canny edge detection on RGB."""
+    """
+    Enhanced edge detection on RGB images, optimized for transparent objects.
+
+    Transparent objects (glass, plastic) are challenging because:
+    1. Low contrast - subtle intensity differences
+    2. No texture - smooth surfaces lack strong gradients
+    3. Specular highlights - reflections can confuse detectors
+
+    This enhanced version uses multiple techniques:
+    1. CLAHE (Contrast Limited Adaptive Histogram Equalization) for local contrast
+    2. Multi-channel processing (grayscale, LAB L-channel, HSV saturation)
+    3. Multi-scale Canny (high + low thresholds combined)
+    4. Gradient magnitude thresholding as additional edge source
+
+    Args:
+        rgb_bgr: (H, W, 3) BGR image
+        cfg: GuidanceConfig with edge detection parameters
+
+    Returns:
+        (H, W) binary edge map as float32 in [0, 1]
+    """
+    if not cfg.rgb_use_enhanced:
+        # Original simple Canny
+        if rgb_bgr.ndim == 3 and rgb_bgr.shape[2] == 3:
+            gray = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = rgb_bgr
+        edges = cv2.Canny(gray, cfg.rgb_canny_thresh1, cfg.rgb_canny_thresh2,
+                          apertureSize=cfg.rgb_canny_aperture)
+        edges = _morph_close(edges, cfg.morph_kernel)
+        return (edges > 0).astype(np.float32)
+
+    # =========================================================================
+    # Enhanced edge detection for transparent objects
+    # =========================================================================
+    h, w = rgb_bgr.shape[:2]
+    edge_maps = []
+
+    # Convert to grayscale
     if rgb_bgr.ndim == 3 and rgb_bgr.shape[2] == 3:
         gray = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2GRAY)
     else:
-        gray = rgb_bgr
-    edges = cv2.Canny(gray, cfg.rgb_canny_thresh1, cfg.rgb_canny_thresh2,
-                      apertureSize=cfg.rgb_canny_aperture)
-    edges = _morph_close(edges, cfg.morph_kernel)
-    return (edges > 0).astype(np.float32)
+        gray = rgb_bgr.copy()
+
+    # ---------------------------------------------------------------------------
+    # 1. CLAHE-enhanced grayscale edges
+    # CLAHE enhances local contrast, making subtle glass boundaries more visible
+    # ---------------------------------------------------------------------------
+    if cfg.rgb_enhance_clahe:
+        clahe = cv2.createCLAHE(clipLimit=cfg.rgb_clahe_clip,
+                                 tileGridSize=(cfg.rgb_clahe_grid, cfg.rgb_clahe_grid))
+        gray_clahe = clahe.apply(gray)
+    else:
+        gray_clahe = gray
+
+    # Standard threshold Canny on CLAHE-enhanced grayscale
+    edges_gray = cv2.Canny(gray_clahe, cfg.rgb_canny_thresh1, cfg.rgb_canny_thresh2,
+                           apertureSize=cfg.rgb_canny_aperture)
+    edge_maps.append(edges_gray)
+
+    # ---------------------------------------------------------------------------
+    # 2. Multi-scale Canny (catch subtle edges with lower thresholds)
+    # Lower thresholds catch faint glass boundaries that standard thresholds miss
+    # ---------------------------------------------------------------------------
+    if cfg.rgb_multi_scale:
+        edges_low = cv2.Canny(gray_clahe, cfg.rgb_canny_low_thresh1, cfg.rgb_canny_low_thresh2,
+                              apertureSize=cfg.rgb_canny_aperture)
+        edge_maps.append(edges_low)
+
+    # ---------------------------------------------------------------------------
+    # 3. LAB L-channel edges (luminance is more robust to color variations)
+    # The L-channel in LAB space better captures brightness changes at glass edges
+    # ---------------------------------------------------------------------------
+    if cfg.rgb_use_lab_channel and rgb_bgr.ndim == 3:
+        lab = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2LAB)
+        l_channel = lab[:, :, 0]
+
+        if cfg.rgb_enhance_clahe:
+            l_channel = clahe.apply(l_channel)
+
+        edges_lab = cv2.Canny(l_channel, cfg.rgb_canny_thresh1, cfg.rgb_canny_thresh2,
+                              apertureSize=cfg.rgb_canny_aperture)
+        edge_maps.append(edges_lab)
+
+        if cfg.rgb_multi_scale:
+            edges_lab_low = cv2.Canny(l_channel, cfg.rgb_canny_low_thresh1, cfg.rgb_canny_low_thresh2,
+                                      apertureSize=cfg.rgb_canny_aperture)
+            edge_maps.append(edges_lab_low)
+
+    # ---------------------------------------------------------------------------
+    # 4. HSV Saturation channel edges
+    # Glass often has subtle saturation changes at boundaries (reflections, tints)
+    # ---------------------------------------------------------------------------
+    if cfg.rgb_use_saturation and rgb_bgr.ndim == 3:
+        hsv = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2HSV)
+        s_channel = hsv[:, :, 1]
+
+        if cfg.rgb_enhance_clahe:
+            s_channel = clahe.apply(s_channel)
+
+        # Use lower thresholds for saturation (often subtle changes)
+        edges_sat = cv2.Canny(s_channel, cfg.rgb_canny_low_thresh1, cfg.rgb_canny_low_thresh2,
+                              apertureSize=cfg.rgb_canny_aperture)
+        edge_maps.append(edges_sat)
+
+    # ---------------------------------------------------------------------------
+    # 5. Gradient magnitude thresholding (catches edges Canny might miss)
+    # Direct gradient magnitude is more sensitive to subtle intensity changes
+    # ---------------------------------------------------------------------------
+    if cfg.rgb_gradient_magnitude:
+        # Apply slight blur to reduce noise
+        blurred = cv2.GaussianBlur(gray_clahe, (3, 3), 0)
+
+        # Compute Sobel gradients
+        gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+        mag = np.sqrt(gx * gx + gy * gy)
+
+        # Adaptive thresholding based on image statistics
+        thresh = np.percentile(mag, cfg.rgb_gradient_percentile)
+        edges_grad = (mag > thresh).astype(np.uint8) * 255
+
+        # Thin the gradient edges using morphological skeleton approximation
+        kernel = np.ones((2, 2), np.uint8)
+        edges_grad = cv2.erode(edges_grad, kernel, iterations=1)
+
+        edge_maps.append(edges_grad)    # ---------------------------------------------------------------------------
+    # Combine all edge maps (union)
+    # ---------------------------------------------------------------------------
+    combined = np.zeros((h, w), dtype=np.uint8)
+    for em in edge_maps:
+        combined = np.maximum(combined, em)
+
+    # Morphological closing to connect nearby edges
+    combined = _morph_close(combined, cfg.morph_kernel)
+
+    return (combined > 0).astype(np.float32)
 
 
 def depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
