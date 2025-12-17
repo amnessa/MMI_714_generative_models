@@ -35,10 +35,12 @@ class GuidanceConfig:
     use_sam_rgb: bool = True              # Use SAM for RGB edges (high quality)
     use_sam_depth: bool = True            # Use SAM for depth edges (high quality)
     sam_model_name: str = "facebook/sam-vit-base"
-    sam_points_per_side: int = 32         # Grid density for automatic mask generation
-    sam_pred_iou_thresh: float = 0.88
-    sam_stability_score_thresh: float = 0.95
+    sam_points_per_side: int = 48         # Grid density (higher = more coverage, slower)
+    sam_pred_iou_thresh: float = 0.70     # Lower to catch transparent objects (was 0.88)
+    sam_stability_score_thresh: float = 0.80  # Lower for glass objects (was 0.95)
     sam_device: str = "cuda"              # or "cpu"
+    sam_use_all_masks: bool = True        # Use all 3 mask scales (small/medium/large)
+    sam_combine_with_canny: bool = True   # Combine SAM boundaries with Canny edges
 
     # PiDiNet configuration (for edge_detector='pidinet')
     pidinet_weights_path: Optional[str] = None  # Path to pretrained weights (.pth)
@@ -125,6 +127,17 @@ def _extract_boundaries_from_masks(masks: np.ndarray) -> Optional[np.ndarray]:
 
 
 def sam_edges_rgb(rgb: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
+    """
+    Use SAM to generate boundary/edge map from RGB image.
+
+    SAM outputs 3 masks per point (small/medium/large). We collect all of them
+    that pass the IoU threshold to maximize boundary coverage.
+
+    For transparent objects like glass, SAM may not segment them well, so we:
+    1. Use lower IoU threshold to accept more uncertain masks
+    2. Collect all 3 mask scales per point
+    3. Optionally combine with Canny edges for complete coverage
+    """
     model, processor = _get_sam_model(cfg)
 
     # Ensure RGB format and uint8
@@ -139,7 +152,6 @@ def sam_edges_rgb(rgb: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
     h, w = rgb.shape[:2]
 
     # --- OPTIMIZATION START: Compute Image Embeddings ONCE ---
-    # We process the image alone first to get the embeddings
     inputs_image = processor(rgb_input, return_tensors="pt").to(cfg.sam_device)
     with torch.no_grad():
         image_embeddings = model.get_image_embeddings(inputs_image["pixel_values"])
@@ -156,55 +168,70 @@ def sam_edges_rgb(rgb: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
             input_points.append([[int(x), int(y)]])
 
     all_masks = []
-    batch_size = 16  # You can likely increase this to 32 or 64 now
+    batch_size = 16
 
     with torch.no_grad():
         for i in range(0, len(input_points), batch_size):
             batch_points = input_points[i:i + batch_size]
 
-            # Use processor to format points, but we will DISCARD the pixel_values
-            # so the model uses our cached embeddings instead.
             inputs = processor(
                 rgb_input,
-                input_points=[batch_points], # Note: processor handles list of lists
+                input_points=[batch_points],
                 return_tensors="pt"
             )
 
-            # Remove pixel_values so model doesn't re-run encoder
             inputs.pop("pixel_values", None)
-
-            # Add our cached embeddings
             inputs["image_embeddings"] = image_embeddings
-
-            # Move remaining inputs (like input_points) to device
             inputs = {k: v.to(cfg.sam_device) for k, v in inputs.items()}
 
             outputs = model(**inputs)
 
-            # Get masks
+            # Get masks - shape is (batch, num_points, 3, H, W) where 3 = mask scales
             masks = processor.image_processor.post_process_masks(
                 outputs.pred_masks.cpu(),
                 inputs["original_sizes"].cpu(),
                 inputs["reshaped_input_sizes"].cpu()
-            )[0]
+            )[0]  # First batch
 
-            iou_scores = outputs.iou_scores.cpu().numpy()[0]
-            for j, score in enumerate(iou_scores[0]):
-                if score > cfg.sam_pred_iou_thresh:
-                    mask = masks[0, j].numpy()
-                    all_masks.append(mask)
+            iou_scores = outputs.iou_scores.cpu().numpy()  # Shape: (batch, num_points, 3)
 
-    if len(all_masks) == 0:
+            # Iterate over each point in the batch
+            for point_idx in range(masks.shape[0]):
+                point_iou_scores = iou_scores[0, point_idx]  # 3 scores for 3 mask scales
+
+                if cfg.sam_use_all_masks:
+                    # Collect ALL 3 mask scales (small/medium/large) that pass threshold
+                    for mask_idx, score in enumerate(point_iou_scores):
+                        if score > cfg.sam_pred_iou_thresh:
+                            mask = masks[point_idx, mask_idx].numpy()
+                            all_masks.append(mask)
+                else:
+                    # Only use the best scoring mask per point (old behavior)
+                    best_idx = np.argmax(point_iou_scores)
+                    if point_iou_scores[best_idx] > cfg.sam_pred_iou_thresh:
+                        mask = masks[point_idx, best_idx].numpy()
+                        all_masks.append(mask)
+
+    # Extract boundaries from SAM masks
+    if len(all_masks) > 0:
+        all_masks = np.array(all_masks)
+        boundary_map = _extract_boundaries_from_masks(all_masks)
+        if boundary_map is not None:
+            boundary_map = _morph_close((boundary_map * 255).astype(np.uint8), cfg.morph_kernel)
+            boundary_map = (boundary_map > 0).astype(np.float32)
+        else:
+            boundary_map = np.zeros((h, w), dtype=np.float32)
+    else:
+        boundary_map = np.zeros((h, w), dtype=np.float32)
+
+    # Optionally combine with Canny edges to catch what SAM misses (like glass edges)
+    if cfg.sam_combine_with_canny:
+        canny_edges = rgb_edges(rgb, cfg)
+        boundary_map = np.maximum(boundary_map, canny_edges)
+
+    # Fallback to pure Canny if SAM produced nothing
+    if boundary_map.sum() == 0:
         return rgb_edges(rgb, cfg)
-
-    all_masks = np.array(all_masks)
-    boundary_map = _extract_boundaries_from_masks(all_masks)
-
-    if boundary_map is None:
-        return rgb_edges(rgb, cfg)
-
-    boundary_map = _morph_close((boundary_map * 255).astype(np.uint8), cfg.morph_kernel)
-    boundary_map = (boundary_map > 0).astype(np.float32)
 
     return boundary_map
 
@@ -212,7 +239,14 @@ def sam_edges_rgb(rgb: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
 def sam_edges_depth(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
     """
     Use SAM to generate boundary/edge map from depth image.
+
     Uses robust preprocessing: sanitization + inverse depth for better edges.
+    Collects all 3 mask scales (small/medium/large) per point.
+    Optionally combines with Canny depth edges for complete coverage.
+
+    NOTE: For transparent objects, the depth sensor sees THROUGH the glass,
+    so depth edges will show the background geometry, not the glass itself.
+    This is expected behavior - we use this to find what's behind the glass.
     """
     model, processor = _get_sam_model(cfg)
 
@@ -286,24 +320,45 @@ def sam_edges_depth(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
                 inputs["reshaped_input_sizes"].cpu()
             )[0]
 
-            iou_scores = outputs.iou_scores.cpu().numpy()[0]
-            for j, score in enumerate(iou_scores[0]):
-                if score > cfg.sam_pred_iou_thresh:
-                    mask = masks[0, j].numpy()
-                    all_masks.append(mask)
+            iou_scores = outputs.iou_scores.cpu().numpy()
 
-    if len(all_masks) == 0:
+            # Iterate over each point in the batch
+            for point_idx in range(masks.shape[0]):
+                point_iou_scores = iou_scores[0, point_idx]  # 3 scores for 3 mask scales
+
+                if cfg.sam_use_all_masks:
+                    # Collect ALL 3 mask scales that pass threshold
+                    for mask_idx, score in enumerate(point_iou_scores):
+                        if score > cfg.sam_pred_iou_thresh:
+                            mask = masks[point_idx, mask_idx].numpy()
+                            all_masks.append(mask)
+                else:
+                    # Only use the best scoring mask per point
+                    best_idx = np.argmax(point_iou_scores)
+                    if point_iou_scores[best_idx] > cfg.sam_pred_iou_thresh:
+                        mask = masks[point_idx, best_idx].numpy()
+                        all_masks.append(mask)
+
+    # Extract boundaries from SAM masks
+    if len(all_masks) > 0:
+        all_masks = np.array(all_masks)
+        boundary_map = _extract_boundaries_from_masks(all_masks)
+        if boundary_map is not None:
+            boundary_map = _morph_close((boundary_map * 255).astype(np.uint8), cfg.morph_kernel)
+            boundary_map = (boundary_map > 0).astype(np.float32)
+        else:
+            boundary_map = np.zeros((h, w), dtype=np.float32)
+    else:
+        boundary_map = np.zeros((h, w), dtype=np.float32)
+
+    # Optionally combine with Canny edges to catch depth discontinuities SAM misses
+    if cfg.sam_combine_with_canny:
+        canny_edges = depth_edges(depth, cfg)
+        boundary_map = np.maximum(boundary_map, canny_edges)
+
+    # Fallback to pure Canny if SAM produced nothing
+    if boundary_map.sum() == 0:
         return depth_edges(depth, cfg)
-
-    all_masks = np.array(all_masks)
-    boundary_map = _extract_boundaries_from_masks(all_masks)
-
-    # Fallback if boundary extraction fails
-    if boundary_map is None:
-        return depth_edges(depth, cfg)
-
-    boundary_map = _morph_close((boundary_map * 255).astype(np.uint8), cfg.morph_kernel)
-    boundary_map = (boundary_map > 0).astype(np.float32)
 
     return boundary_map
 

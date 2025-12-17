@@ -283,6 +283,14 @@ def main():
     parser.add_argument("--sam-model", default="facebook/sam-vit-base",
                         choices=["facebook/sam-vit-base", "facebook/sam-vit-large"],
                         help="SAM model to use")
+    parser.add_argument("--sam-iou-thresh", type=float, default=0.70,
+                        help="SAM IoU threshold (lower catches glass, default 0.70)")
+    parser.add_argument("--sam-points", type=int, default=48,
+                        help="SAM grid density (higher=more coverage, default 48)")
+    parser.add_argument("--no-sam-canny-combine", action="store_true",
+                        help="Don't combine SAM with Canny edges")
+    parser.add_argument("--no-sam-all-masks", action="store_true",
+                        help="Only use best mask per point (not all 3 scales)")
     parser.add_argument("--num-classes", type=int, default=2,
                         help="Number of classes to test")
     parser.add_argument("--samples-per-class", type=int, nargs="+", default=[0, 50, 100],
@@ -316,6 +324,10 @@ def main():
         use_sam_depth=use_sam_depth,
         sam_device="cuda" if use_sam else "cpu",
         sam_model_name=args.sam_model,
+        sam_pred_iou_thresh=args.sam_iou_thresh,
+        sam_points_per_side=args.sam_points,
+        sam_combine_with_canny=not args.no_sam_canny_combine,
+        sam_use_all_masks=not args.no_sam_all_masks,
         depth_max_distance=10.0,
         depth_use_inverse=True,
         depth_use_canny=True,
@@ -326,6 +338,8 @@ def main():
     print("Testing edge extraction...")
     print(f"Config: use_sam={use_sam}, use_sam_rgb={use_sam_rgb}, use_sam_depth={use_sam_depth}")
     print(f"        sam_model={args.sam_model if use_sam else 'N/A'}")
+    print(f"        sam_iou_thresh={cfg.sam_pred_iou_thresh}, sam_points={cfg.sam_points_per_side}")
+    print(f"        sam_combine_with_canny={cfg.sam_combine_with_canny}, sam_use_all_masks={cfg.sam_use_all_masks}")
     print(f"        inverse_depth={cfg.depth_use_inverse}, canny={cfg.depth_use_canny}")
     print(f"        fallback_threshold={args.fallback_threshold*100:.1f}%")
 
