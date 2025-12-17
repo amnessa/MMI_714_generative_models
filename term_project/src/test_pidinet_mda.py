@@ -249,9 +249,9 @@ def main():
 
     # Test on a few samples from different classes
     test_cases = [
-        ("cup-with-waves-train", 0),
-        ("cup-with-waves-train", 50),
-        ("stemless-plastic-champagne-glass-train", 0),
+        ("cup-with-waves-train", 8),
+        ("cup-with-waves-train", 4589),
+        ("stemless-plastic-champagne-glass-train", 149),
     ]
 
     figs = []
