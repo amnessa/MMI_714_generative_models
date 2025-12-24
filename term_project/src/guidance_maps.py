@@ -10,7 +10,7 @@ class GuidanceConfig:
     # =========================================================================
     # Edge detector selection: 'canny', 'sam', or 'pidinet'
     # =========================================================================
-    edge_detector: Literal['canny', 'sam', 'pidinet'] = 'pidinet'
+    edge_detector: Literal['canny', 'sam', 'pidinet'] = 'canny'
 
     # Classic edge detection params (for edge_detector='canny')
     rgb_canny_thresh1: int = 100

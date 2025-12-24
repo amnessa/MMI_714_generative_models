@@ -19,7 +19,7 @@ GUIDANCE_DIR_GEO = "guidance-geometric-mrgb"
 IMG_SIZE = (128, 128)
 
 
-def process_dataset(edge_detector: str = 'pidinet'):
+def process_dataset(edge_detector: str = 'canny'):
     """
     Pre-compute guidance maps for the entire dataset.
 
@@ -156,9 +156,9 @@ if __name__ == "__main__":
     from typing import Literal
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--edge-detector", type=str, default="pidinet",
+    parser.add_argument("--edge-detector", type=str, default="canny",
                         choices=["pidinet", "canny", "sam"],
-                        help="Edge detector to use: pidinet (default), canny, or sam")
+                        help="Edge detector to use: canny (default), pidinet, or sam")
     args = parser.parse_args()
 
     process_dataset(edge_detector=args.edge_detector)
