@@ -41,6 +41,17 @@ class GuidanceConfig:
     depth_canny_thresh2: int = 100        # Upper threshold for depth Canny
     depth_edge_dilate: int = 0            # Dilation iterations (0=none, 1-2 for more coverage)
 
+    # Enhanced edge detection for depth images
+    depth_use_enhanced: bool = True       # Use enhanced edge detection for depth
+    depth_enhance_clahe: bool = True      # Apply CLAHE for local contrast enhancement
+    depth_clahe_clip: float = 2.0         # CLAHE clip limit
+    depth_clahe_grid: int = 8             # CLAHE tile grid size
+    depth_multi_scale: bool = True        # Combine edges at multiple Canny thresholds
+    depth_canny_low_thresh1: int = 15     # Lower threshold pair for subtle depth edges
+    depth_canny_low_thresh2: int = 50
+    depth_gradient_magnitude: bool = False # Also use gradient magnitude thresholding
+    depth_gradient_percentile: float = 85.0 # Percentile for gradient thresholding
+
     # SAM configuration (for edge_detector='sam')
     # NOTE: SAM cannot run in DataLoader workers (CUDA context issues).
     # Enable SAM only for single-threaded/inference use or precomputation.
@@ -522,13 +533,18 @@ def rgb_edges(rgb_bgr: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
 
 def depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
     """
-    Robust edge detection on depth maps.
+    Enhanced edge detection on depth maps.
 
     Handles the challenges of raw EXR depth data:
     1. Sanitizes NaN/Inf values (sensor errors, sky)
     2. Optionally converts to inverse depth (1/z) for better near-object edges
     3. Normalizes to 0-255 range for edge detection
-    4. Uses Canny (more robust) or Sobel for edge extraction
+    4. Uses enhanced techniques (CLAHE, multi-scale) for better edge detection
+
+    Enhanced mode adds:
+    - CLAHE for local contrast enhancement (reveals subtle depth discontinuities)
+    - Multi-scale Canny (high + low thresholds combined)
+    - Optional gradient magnitude thresholding
 
     Args:
         depth: (H, W) raw depth map (can contain NaN, Inf, large values)
@@ -538,6 +554,7 @@ def depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
         (H, W) binary edge map as float32 in [0, 1]
     """
     d = depth.astype(np.float32)
+    h, w = d.shape[:2]
 
     # Step 1: Create validity mask (before sanitization)
     valid_mask = np.isfinite(d) & (d > 0)
@@ -575,18 +592,62 @@ def depth_edges(depth: np.ndarray, cfg: GuidanceConfig) -> np.ndarray:
     # Step 5: Apply Gaussian blur to reduce noise
     d_uint8 = cv2.GaussianBlur(d_uint8, (3, 3), 0)
 
-    # Step 6: Edge detection
-    if cfg.depth_use_canny:
-        # Canny is more robust and produces cleaner edges
-        edges = cv2.Canny(d_uint8, cfg.depth_canny_thresh1, cfg.depth_canny_thresh2,
-                          apertureSize=cfg.rgb_canny_aperture)
+    # =========================================================================
+    # Enhanced edge detection for depth (similar to RGB enhancement)
+    # =========================================================================
+    if cfg.depth_use_enhanced:
+        edge_maps = []
+
+        # Apply CLAHE for local contrast enhancement
+        if cfg.depth_enhance_clahe:
+            clahe = cv2.createCLAHE(clipLimit=cfg.depth_clahe_clip,
+                                     tileGridSize=(cfg.depth_clahe_grid, cfg.depth_clahe_grid))
+            d_clahe = clahe.apply(d_uint8)
+        else:
+            d_clahe = d_uint8
+
+        # Standard threshold Canny on CLAHE-enhanced depth
+        if cfg.depth_use_canny:
+            edges_std = cv2.Canny(d_clahe, cfg.depth_canny_thresh1, cfg.depth_canny_thresh2,
+                                  apertureSize=cfg.rgb_canny_aperture)
+            edge_maps.append(edges_std)
+
+        # Multi-scale Canny (lower thresholds to catch subtle depth discontinuities)
+        if cfg.depth_multi_scale:
+            edges_low = cv2.Canny(d_clahe, cfg.depth_canny_low_thresh1, cfg.depth_canny_low_thresh2,
+                                  apertureSize=cfg.rgb_canny_aperture)
+            edge_maps.append(edges_low)
+
+        # Gradient magnitude thresholding
+        if cfg.depth_gradient_magnitude:
+            blurred = cv2.GaussianBlur(d_clahe, (3, 3), 0)
+            gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+            mag = np.sqrt(gx * gx + gy * gy)
+            thresh = np.percentile(mag, cfg.depth_gradient_percentile)
+            edges_grad = (mag > thresh).astype(np.uint8) * 255
+            # Thin edges
+            kernel = np.ones((2, 2), np.uint8)
+            edges_grad = cv2.erode(edges_grad, kernel, iterations=1)
+            edge_maps.append(edges_grad)
+
+        # Combine all edge maps
+        edges = np.zeros((h, w), dtype=np.uint8)
+        for em in edge_maps:
+            edges = np.maximum(edges, em)
+
     else:
-        # Fallback to Sobel
-        gx = cv2.Sobel(d_uint8, cv2.CV_32F, 1, 0, ksize=cfg.depth_sobel_ksize)
-        gy = cv2.Sobel(d_uint8, cv2.CV_32F, 0, 1, ksize=cfg.depth_sobel_ksize)
-        mag = np.sqrt(gx * gx + gy * gy)
-        thr = np.percentile(mag, cfg.depth_edge_percentile)
-        edges = (mag >= thr).astype(np.uint8) * 255
+        # Original simple edge detection
+        if cfg.depth_use_canny:
+            edges = cv2.Canny(d_uint8, cfg.depth_canny_thresh1, cfg.depth_canny_thresh2,
+                              apertureSize=cfg.rgb_canny_aperture)
+        else:
+            # Fallback to Sobel
+            gx = cv2.Sobel(d_uint8, cv2.CV_32F, 1, 0, ksize=cfg.depth_sobel_ksize)
+            gy = cv2.Sobel(d_uint8, cv2.CV_32F, 0, 1, ksize=cfg.depth_sobel_ksize)
+            mag = np.sqrt(gx * gx + gy * gy)
+            thr = np.percentile(mag, cfg.depth_edge_percentile)
+            edges = (mag >= thr).astype(np.uint8) * 255
 
     # Step 7: Morphological closing to connect nearby edges
     edges = _morph_close(edges, cfg.morph_kernel)
@@ -668,13 +729,14 @@ def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig,
 
     - M_RGB: Edges from RGB image (sees transparent objects + background)
     - M_D: Edges from depth image (sees background THROUGH transparent objects)
-    - M_DA: Intersection = edges that are confirmed in both modalities
+    - M_DA: Difference (M_RGB - M_D) = edges visible in RGB but NOT in depth
+            This captures glass boundaries that the depth sensor cannot see.
 
     IMPORTANT: For depth edge detection, use `zeroed_depth` (depth with transparent
     region set to 0) to get edges of what's visible through/behind the glass.
 
-    Safety Net: If M_DA < 1% of mask pixels, fallback to whichever has more
-    edge pixels (M_RGB or M_D). This prevents guidance map being empty/useless.
+    Safety Net: If M_DA < 1% of mask pixels, fallback to M_RGB (edges inside mask).
+    This prevents guidance map being empty/useless.
 
     Args:
         rgb_bgr: (H, W, 3) BGR image
@@ -686,7 +748,7 @@ def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig,
         fallback_threshold: Minimum ratio of M_DA pixels to mask pixels (default 1%)
 
     Returns:
-        (H, W) guidance map - intersection of RGB and Depth edges, masked to transparent region
+        (H, W) guidance map - difference of RGB and Depth edges, masked to transparent region
     """
     # Get RGB edges (sees everything including transparent object boundaries)
     e_rgb = _get_rgb_edges(rgb_bgr, cfg)
@@ -696,19 +758,20 @@ def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig,
     depth_for_edges = zeroed_depth if zeroed_depth is not None else depth
     e_d = _get_depth_edges(depth_for_edges, cfg)
 
-    # M_DA = M_RGB ∩ M_D (INTERSECTION)
-    # This gives us edges that are confirmed in both modalities
-    mda_raw = np.minimum(e_rgb, e_d)  # Intersection for binary maps
+    # M_DA = M_RGB - M_D (DIFFERENCE)
+    # This captures edges visible in RGB but NOT in depth (glass boundaries)
+    # The depth sensor sees through glass, so depth edges show background geometry
+    # RGB edges see the glass itself, so (RGB - Depth) = glass boundaries only
+    mda_raw = np.maximum(e_rgb - e_d, 0)  # Difference, clipped to non-negative
 
     # Apply mask: guidance only inside transparent region
     if mask is not None:
         mda_masked = mda_raw * mask
         e_rgb_masked = e_rgb * mask
-        e_d_masked = e_d * mask
 
         # =====================================================================
-        # SAFETY NET: Fallback if intersection is too sparse
-        # If M_DA has less than 1% of mask pixels, use M_RGB or M_D as fallback
+        # SAFETY NET: Fallback if difference is too sparse
+        # If M_DA has less than threshold % of mask pixels, fallback to M_RGB
         # =====================================================================
         mask_pixel_count = mask.sum()
         mda_pixel_count = mda_masked.sum()
@@ -717,30 +780,24 @@ def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig,
             mda_ratio = mda_pixel_count / mask_pixel_count
 
             if mda_ratio < fallback_threshold:
-                # Intersection is too sparse, need fallback
+                # Difference is too sparse, fallback to M_RGB inside mask
                 e_rgb_count = e_rgb_masked.sum()
-                e_d_count = e_d_masked.sum()
 
-                if e_rgb_count > 0 or e_d_count > 0:
-                    # Use whichever has more edge pixels inside mask
-                    if e_rgb_count >= e_d_count:
-                        out = e_rgb_masked
-                        # Optionally log this for debugging
-                        # print(f"M_DA fallback: using M_RGB ({e_rgb_count:.0f} px > M_D {e_d_count:.0f} px)")
-                    else:
-                        out = e_d_masked
-                        # print(f"M_DA fallback: using M_D ({e_d_count:.0f} px > M_RGB {e_rgb_count:.0f} px)")
+                if e_rgb_count > 0:
+                    out = e_rgb_masked
+                    # Optionally log this for debugging
+                    # print(f"M_DA fallback: using M_RGB ({e_rgb_count:.0f} px)")
                 else:
-                    # Both M_RGB and M_D have zero pixels in mask - do nothing (return zeros)
-                    out = mda_masked  # Will be all zeros
+                    # M_RGB also empty - return zeros
+                    out = mda_masked
             else:
-                # Intersection is sufficient, use it
+                # Difference is sufficient, use it
                 out = mda_masked
         else:
             # No mask pixels (shouldn't happen, but handle gracefully)
             out = mda_masked
     else:
-        # No mask provided, return raw intersection
+        # No mask provided, return raw difference
         out = mda_raw
 
     return out.astype(np.float32)
