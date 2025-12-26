@@ -117,12 +117,12 @@ class GaussianDiffusion(nn.Module):
             # If Geometric Branch, loss_mask is 1 on background.
 
             # Option A: Hard Masking (Only learn the specific region)
-            # loss = (err * loss_mask).sum() / (loss_mask.sum() + 1e-5)
+            loss = (err * loss_mask).sum() / (loss_mask.sum() + 1e-5)
 
             # Option B: Weighted Masking (Recommended - keeps context)
             # Weight the region of interest 10x more than the rest
-            weights = 1.0 + (loss_mask * 9.0)
-            loss = (err * weights).mean()
+            # weights = 1.0 + (loss_mask * 9.0)
+            # loss = (err * weights).mean()
         else:
             loss = err.mean()
         return loss
