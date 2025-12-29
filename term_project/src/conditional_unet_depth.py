@@ -115,27 +115,53 @@ class Upsample(nn.Module):
 
 
 class Attention(nn.Module):
-    """Simple multi-head self-attention block for 2D feature maps."""
+    """Multi-head attention block for 2D feature maps with optional cross-attention.
 
-    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32):
+    When context is None: performs self-attention (Q, K, V from x).
+    When context is provided: performs cross-attention (Q from x, K/V from context).
+    """
+
+    def __init__(self, dim: int, context_dim: Optional[int] = None, heads: int = 4, dim_head: int = 32):
         super().__init__()
         self.heads = heads
         self.scale = dim_head ** -0.5
         inner_dim = dim_head * heads
 
+        # If context_dim is provided, use cross-attention; otherwise self-attention
+        self.is_cross_attention = exists(context_dim)
+        context_dim = default(context_dim, dim)
+
         self.norm = nn.GroupNorm(8, dim)
-        self.to_qkv = nn.Conv2d(dim, inner_dim * 3, 1, bias=False)
+        self.norm_context = nn.GroupNorm(8, context_dim) if self.is_cross_attention else None
+
+        # Q always comes from x
+        self.to_q = nn.Conv2d(dim, inner_dim, 1, bias=False)
+        # K, V come from context (or x if self-attention)
+        self.to_kv = nn.Conv2d(context_dim, inner_dim * 2, 1, bias=False)
         self.to_out = nn.Conv2d(inner_dim, dim, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         b, c, h, w = x.shape
         x_norm = self.norm(x)
 
-        qkv = self.to_qkv(x_norm).chunk(3, dim=1)
-        q, k, v = map(
-            lambda t: rearrange(t, "b (h d) x y -> b h (x y) d", h=self.heads),
-            qkv,
-        )
+        # For self-attention, context is x itself
+        if context is None:
+            context_norm = x_norm
+        else:
+            # For cross-attention, normalize and potentially resize context
+            context_norm = self.norm_context(context)
+            # Handle spatial dimension mismatch by interpolating context
+            if context_norm.shape[-2:] != x.shape[-2:]:
+                context_norm = F.interpolate(context_norm, size=(h, w), mode='bilinear', align_corners=False)
+
+        # Q from x, K/V from context
+        q = self.to_q(x_norm)
+        kv = self.to_kv(context_norm).chunk(2, dim=1)
+        k, v = kv
+
+        q = rearrange(q, "b (heads d) x y -> b heads (x y) d", heads=self.heads)
+        k = rearrange(k, "b (heads d) x y -> b heads (x y) d", heads=self.heads)
+        v = rearrange(v, "b (heads d) x y -> b heads (x y) d", heads=self.heads)
 
         q = q * self.scale
         attn = torch.softmax(torch.einsum("b h i d, b h j d -> b h i j", q, k), dim=-1)
@@ -143,7 +169,6 @@ class Attention(nn.Module):
         out = rearrange(out, "b h (x y) d -> b (h d) x y", h=self.heads, x=h, y=w)
         out = self.to_out(out)
         return out + x
-
 
 # --- Conditional U-Net for depth completion ---
 
@@ -183,6 +208,7 @@ class ConditionalUNetDepth(nn.Module):
         # e.g. 3xRGB + 1x raw / incomplete depth [+ optional guidance maps]
         self.in_channels_cond = cond_channels
         self.out_channels = 1      # noise on depth
+        self.channel_mults = channel_mults
 
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),
@@ -194,18 +220,35 @@ class ConditionalUNetDepth(nn.Module):
         init_dim = base_channels
         self.x_in = nn.Conv2d(self.in_channels_x + self.in_channels_cond, init_dim, 3, padding=1)
 
+        # Condition encoder: encode cond_rgbd to feature maps at each resolution
+        self.cond_in = nn.Conv2d(self.in_channels_cond, init_dim, 3, padding=1)
+        self.cond_downs = nn.ModuleList([])
+
+        cond_ch = init_dim
+        for i, mult in enumerate(channel_mults):
+            out_ch = base_channels * mult
+            # One ResnetBlock per level to project conditioning features
+            self.cond_downs.append(ResnetBlock(cond_ch, out_ch, time_emb_dim=None))
+            cond_ch = out_ch
+            if i != len(channel_mults) - 1:
+                self.cond_downs.append(Downsample(cond_ch, cond_ch))
+
         # encoder
         self.downs = nn.ModuleList([])
         self.skip_channels = []  # channels for each skip connection
+        self.cond_dims = []  # track conditioning dims at each attention level
 
         in_ch = init_dim
         curr_res = None  # keep abstract for now (no resolution-based attention)
 
+        cond_level_idx = 0  # track which conditioning level we're at
         for i, mult in enumerate(channel_mults):
             out_ch = base_channels * mult
+            cond_dim_at_level = base_channels * mult  # conditioning channels at this level
             for _ in range(num_res_blocks):
                 block = ResnetBlock(in_ch, out_ch, time_emb_dim=time_emb_dim)
-                attn = Attention(out_ch) if (curr_res in use_attention_resolutions) else nn.Identity()
+                # Create cross-attention with context_dim matching conditioning features
+                attn = Attention(out_ch, context_dim=cond_dim_at_level) if (curr_res in use_attention_resolutions) else nn.Identity()
                 self.downs.append(nn.ModuleDict({"block": block, "attn": attn}))
                 in_ch = out_ch
                 self.skip_channels.append(in_ch)
@@ -214,9 +257,10 @@ class ConditionalUNetDepth(nn.Module):
             if i != len(channel_mults) - 1:
                 self.downs.append(nn.ModuleDict({"downsample": Downsample(in_ch, in_ch)}))
 
-        # bottleneck
+        # bottleneck (use cross-attention with deepest conditioning features)
+        bottleneck_cond_dim = base_channels * channel_mults[-1]
         self.mid_block1 = ResnetBlock(in_ch, in_ch, time_emb_dim=time_emb_dim)
-        self.mid_attn = Attention(in_ch)
+        self.mid_attn = Attention(in_ch, context_dim=bottleneck_cond_dim)
         self.mid_block2 = ResnetBlock(in_ch, in_ch, time_emb_dim=time_emb_dim)
 
         # decoder
@@ -225,6 +269,7 @@ class ConditionalUNetDepth(nn.Module):
         # we will traverse skip connections in reverse order
         for i, mult in reversed(list(enumerate(channel_mults))):
             out_ch = base_channels * mult
+            cond_dim_at_level = base_channels * mult
             for _ in range(num_res_blocks):
                 # take the last recorded skip channel for concatenation
                 skip_ch = self.skip_channels.pop()
@@ -232,7 +277,7 @@ class ConditionalUNetDepth(nn.Module):
                     nn.ModuleDict(
                         {
                             "block": ResnetBlock(in_ch + skip_ch, out_ch, time_emb_dim=time_emb_dim),
-                            "attn": Attention(out_ch) if (curr_res in use_attention_resolutions) else nn.Identity(),
+                            "attn": Attention(out_ch, context_dim=cond_dim_at_level) if (curr_res in use_attention_resolutions) else nn.Identity(),
                         }
                     )
                 )
@@ -273,34 +318,56 @@ class ConditionalUNetDepth(nn.Module):
 
         time_emb = self.time_mlp(t)
 
+        # Encode conditioning features at multiple resolutions for cross-attention
+        cond_feats = []
+        c = self.cond_in(cond_rgbd)
+        for module in self.cond_downs:
+            if isinstance(module, ResnetBlock):
+                c = module(c)
+                cond_feats.append(c)  # Store conditioning at each resolution level
+            elif isinstance(module, Downsample):
+                c = module(c)
+
+        # Main U-Net path (still concatenate at input for backward compatibility)
         x = torch.cat([x_noisy_depth, cond_rgbd], dim=1)
         x = self.x_in(x)
 
         hs = []
+        cond_level = 0  # Track which conditioning resolution level we're at
 
         # encoder path
         for module in self.downs:
             if isinstance(module, nn.ModuleDict) and ("block" in module):
                 x = module["block"](x, time_emb=time_emb)
-                x = module["attn"](x)
+                # Pass conditioning to attention (cross-attention)
+                if not isinstance(module["attn"], nn.Identity):
+                    x = module["attn"](x, context=cond_feats[cond_level])
+                else:
+                    x = module["attn"](x)
                 hs.append(x)
             elif isinstance(module, nn.ModuleDict) and ("downsample" in module):
                 x = module["downsample"](x)
+                cond_level += 1  # Move to next conditioning resolution
 
-        # bottleneck
+        # bottleneck (use deepest conditioning features)
         x = self.mid_block1(x, time_emb=time_emb)
-        x = self.mid_attn(x)
+        x = self.mid_attn(x, context=cond_feats[-1])
         x = self.mid_block2(x, time_emb=time_emb)
 
-        # decoder path
+        # decoder path (traverse conditioning levels in reverse)
         for module in self.ups:
             if isinstance(module, nn.ModuleDict) and ("block" in module):
                 skip = hs.pop()
                 x = torch.cat([x, skip], dim=1)
                 x = module["block"](x, time_emb=time_emb)
-                x = module["attn"](x)
+                # Pass conditioning to attention (cross-attention)
+                if not isinstance(module["attn"], nn.Identity):
+                    x = module["attn"](x, context=cond_feats[cond_level])
+                else:
+                    x = module["attn"](x)
             elif isinstance(module, nn.ModuleDict) and ("upsample" in module):
                 x = module["upsample"](x)
+                cond_level -= 1  # Move to previous conditioning resolution
 
         x = self.out_norm(x)
         x = self.out_act(x)

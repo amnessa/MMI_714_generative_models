@@ -111,21 +111,24 @@ class GaussianDiffusion(nn.Module):
         # The conditioning is what differentiates the branches, not the loss region
         err = (noise - model_out) ** 2
 
-        # loss_mask = batch.get("loss_mask", None)
-        # if loss_mask is not None:
-        #     # If this is Optical Branch, loss_mask is 1 on glass.
-        #     # If Geometric Branch, loss_mask is 1 on background.
+        loss_mask = batch.get("loss_mask", None)
+        if loss_mask is not None:
+            # If this is Optical Branch, loss_mask is 1 on glass.
+            # If Geometric Branch, loss_mask is 1 on background.
 
-        #     # Option A: Hard Masking (Only learn the specific region)
-        #     loss = (err * loss_mask).sum() / (loss_mask.sum() + 1e-5)
+            # Option A: Hard Masking (Only learn the specific region)
+            # loss = (err * loss_mask).sum() / (loss_mask.sum() + 1e-6)
 
-        #     # Option B: Weighted Masking (Recommended - keeps context)
-        #     # Weight the region of interest 10x more than the rest
-        #     # weights = 1.0 + (loss_mask * 9.0)
-        #     # loss = (err * weights).mean()
-        # else:
-        #     loss = err.mean()
-        loss = err.mean()
+            # Option B: Weighted Masking (Recommended - keeps context)
+            target_loss = (err* loss_mask).sum() / (loss_mask.sum() + 1e-6)
+
+            inverse_mask = 1.0 - loss_mask
+            context_loss = (err * inverse_mask).mean()
+            loss = target_loss + (0.6 * context_loss)
+
+        else:
+            loss = err.mean()
+        #loss = err.mean()
         return loss
 
     # ---------------------------------------------------------------------
