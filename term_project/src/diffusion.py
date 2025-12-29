@@ -113,19 +113,23 @@ class GaussianDiffusion(nn.Module):
 
         loss_mask = batch.get("loss_mask", None)
         if loss_mask is not None:
-            # If this is Optical Branch, loss_mask is 1 on glass.
-            # If Geometric Branch, loss_mask is 1 on background.
+            # 1. Target (Glass)
+            target_sum = loss_mask.sum()
+            # CRITICAL FIX: Clamp denominator to min=1.0.
+            # If target_sum < 1, the division is safe.
+            target_loss = (err * loss_mask).sum() / max(target_sum, 1.0)
 
-            # Option A: Hard Masking (Only learn the specific region)
-            # loss = (err * loss_mask).sum() / (loss_mask.sum() + 1e-6)
+            # 2. Context (Background)
+            inverse_mask = (1.0 - loss_mask)
+            context_sum = inverse_mask.sum()
+            context_loss = (err * inverse_mask).sum() / max(context_sum, 1.0)
 
-            # Option B: Weighted Masking (Recommended - keeps context)
-            target_loss = (err* loss_mask).sum() / (loss_mask.sum() + 1e-6)
-
-            inverse_mask = 1.0 - loss_mask
-            context_loss = (err * inverse_mask).mean()
-            loss = target_loss + (0.6 * context_loss)
-
+            # 3. Weighted Combination
+            if target_sum < 1.0:
+                # If no glass, purely learn background
+                loss = context_loss
+            else:
+                loss = (0.6 * target_loss) + (0.4 * context_loss)
         else:
             loss = err.mean()
         #loss = err.mean()
