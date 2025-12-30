@@ -111,28 +111,14 @@ class GaussianDiffusion(nn.Module):
         # The conditioning is what differentiates the branches, not the loss region
         err = (noise - model_out) ** 2
 
-        loss_mask = batch.get("loss_mask", None)
-        if loss_mask is not None:
-            # 1. Target (Glass)
-            target_sum = loss_mask.sum()
-            # CRITICAL FIX: Clamp denominator to min=1.0.
-            # If target_sum < 1, the division is safe.
-            target_loss = (err * loss_mask).sum() / max(target_sum, 1.0)
 
-            # 2. Context (Background)
-            inverse_mask = (1.0 - loss_mask)
-            context_sum = inverse_mask.sum()
-            context_loss = (err * inverse_mask).sum() / max(context_sum, 1.0)
+        loss = err.mean()
+        # 2. NaN/Inf Safety Net
+        # If loss is broken, return 0.0 so the optimizer step does nothing (skips).
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"[Warning] Loss became {loss.item()} at step t={t[0].item()}. Returning 0.0 to skip.")
+            return torch.tensor(0.0, device=device, requires_grad=True)
 
-            # 3. Weighted Combination
-            if target_sum < 1.0:
-                # If no glass, purely learn background
-                loss = context_loss
-            else:
-                loss = (0.6 * target_loss) + (0.4 * context_loss)
-        else:
-            loss = err.mean()
-        #loss = err.mean()
         return loss
 
     # ---------------------------------------------------------------------
