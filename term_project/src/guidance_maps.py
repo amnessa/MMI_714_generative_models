@@ -725,7 +725,7 @@ def m_da(rgb_bgr: np.ndarray, depth: np.ndarray, cfg: GuidanceConfig,
     """
     Depth-Aware boundary map for OPTICAL inpainting (Track A).
 
-    Per DITR paper: M_DA = M_RGB \\\\ C_U(M_D) = M_RGB ∩ M_D (INTERSECTION)
+    Per DITR paper: M_DA = M_RGB \\\\ C_U(M_D) = M_RGB - M_D (INTERSECTION)
 
     - M_RGB: Edges from RGB image (sees transparent objects + background)
     - M_D: Edges from depth image (sees background THROUGH transparent objects)
@@ -811,19 +811,23 @@ def m_rgb(rgb_bgr: np.ndarray, cfg: GuidanceConfig,
     Args:
         rgb_bgr: (H, W, 3) BGR image
         cfg: GuidanceConfig
-        mask: Optional (H, W) mask where 1=transparent area
+
 
     Returns:
-        (H, W) guidance map, optionally masked to background region only
+        (H, W) guidance map
     """
     # Get RGB edges using configured detector
     edges = _get_rgb_edges(rgb_bgr, cfg)
 
-    # Apply inverse mask: guidance only outside transparent region (background)
-    if mask is not None:
-        out = edges * (1.0 - mask)
-    else:
-        out = edges
+    # # Apply inverse mask: guidance only outside transparent region (background)
+    # if mask is not None:
+    #     out = edges * (1.0 - mask)
+    # else:
+    #     out = edges
+
+    # save full mrgb map
+
+    out = edges
 
     return out.astype(np.float32)
 
@@ -895,10 +899,10 @@ if __name__ == "__main__":
 
     # Test with SAM (if available)
     try:
-        cfg_sam = GuidanceConfig(use_sam=True, sam_device="cuda")
+        cfg_sam = GuidanceConfig(use_sam=False, sam_device="cuda")
         m_da_sam = m_da(rgb, depth, cfg_sam, mask)
         m_rgb_sam = m_rgb(rgb, cfg_sam, mask)
-        print(f"M_DA (SAM) shape: {m_da_sam.shape}, range: [{m_da_sam.min():.3f}, {m_da_sam.max():.3f}]")
-        print(f"M_RGB (SAM) shape: {m_rgb_sam.shape}, range: [{m_rgb_sam.min():.3f}, {m_rgb_sam.max():.3f}]")
+        print(f"M_DA shape: {m_da_sam.shape}, range: [{m_da_sam.min():.3f}, {m_da_sam.max():.3f}]")
+        print(f"M_RGB shape: {m_rgb_sam.shape}, range: [{m_rgb_sam.min():.3f}, {m_rgb_sam.max():.3f}]")
     except Exception as e:
         print(f"SAM test skipped: {e}")
