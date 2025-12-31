@@ -229,7 +229,14 @@ class DepthInpaintDataset(Dataset):
             if guide is None and c.include_guidance:
                 # Fallback: compute on-the-fly
                 zeroed_depth = depth * (1.0 - mask)
-                guide = m_da(rgb, depth, self.gcfg, mask, zeroed_depth=zeroed_depth)
+                mda_full =  m_da(rgb, depth, self.gcfg, mask=None, zeroed_depth=zeroed_depth)
+
+                # get background edges for outside masked area
+                mrgb_full = m_rgb(rgb, self.gcfg, mask=None)
+
+                # combine both maps: use m_da inside mask, m_rgb outside
+                guide = (mask * mda_full) + ((1.0 - mask) * mrgb_full)
+
             elif guide is None:
                 guide = np.zeros_like(mask)
 
@@ -241,8 +248,8 @@ class DepthInpaintDataset(Dataset):
             loss_mask = 1.0 - mask  # Kept for inference merging
             cond_depth = raw_depth  # Same raw depth for geometric
             if guide is None and c.include_guidance:
-                # Fallback: compute on-the-fly
-                guide = m_rgb(rgb, self.gcfg, mask)
+                #trained on everywhere
+                guide = m_rgb(rgb, self.gcfg, mask=None)
             elif guide is None:
                 guide = np.zeros_like(mask)
 
