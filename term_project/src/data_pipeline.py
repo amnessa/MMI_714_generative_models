@@ -32,7 +32,7 @@ class DepthDataConfig:
     sigma_mask: float = 0.08   # heavy noise in transparent region
     sigma_global: float = 0.01 # light noise overall
     branch: Literal["optical", "geometric"] = "optical"
-    include_guidance: bool = True
+    include_guidance: bool = False  # Disabled for ablation study
     use_precomputed_guidance: bool = True  # Use pre-computed maps if available
 
 
